@@ -1,0 +1,10 @@
+﻿fileFormatVersion: 2
+guid: c830f140a6ce4e34912a6d8250bea532
+timeCreated: 1691505704
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Headers/HPacking.hlsl
+  uploadId: 728261

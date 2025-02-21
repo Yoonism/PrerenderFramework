@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: fac84b4723b809249a5c2677f01b7b86
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Illumin/MK_Illumin-DiffuseBumped.shader
+  uploadId: 705540

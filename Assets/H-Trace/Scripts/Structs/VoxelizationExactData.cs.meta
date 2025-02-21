@@ -1,0 +1,10 @@
+﻿fileFormatVersion: 2
+guid: 265fbdeb817f45e1825a05afa60b26ec
+timeCreated: 1694154676
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Scripts/Structs/VoxelizationExactData.cs
+  uploadId: 728261

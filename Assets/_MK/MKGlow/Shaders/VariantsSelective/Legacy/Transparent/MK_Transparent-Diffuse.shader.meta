@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: dadfcbf3fd9ab9e4ba80fe75af45f5a0
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Transparent/MK_Transparent-Diffuse.shader
+  uploadId: 705540

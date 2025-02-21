@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 600b4bb90de25494588cb8af5c093984
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Headers/HMain.hlsl
+  uploadId: 728261

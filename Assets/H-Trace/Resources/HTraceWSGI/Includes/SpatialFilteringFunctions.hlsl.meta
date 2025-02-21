@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: b659be2febbce094ea094c40c894d9d5
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Includes/SpatialFilteringFunctions.hlsl
+  uploadId: 728261

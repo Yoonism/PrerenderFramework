@@ -1,0 +1,10 @@
+fileFormatVersion: 2
+guid: 1589b6816cb245e1b389f5d4958e3f5a
+timeCreated: 1715956615
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Scripts/VoxelCameras/VoxelOctantCamera.cs
+  uploadId: 728261

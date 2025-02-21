@@ -1,0 +1,294 @@
+#pragma kernel LightEvaluation
+#pragma kernel ScreenSpaceTracing
+
+#pragma warning (disable : 4000)
+
+#pragma multi_compile _ HIT_SCREEN_SPACE_LIGHTING
+#pragma multi_compile PROBE_VOLUMES_OFF PROBE_VOLUMES_L1 PROBE_VOLUMES_L2
+
+#include "../Includes/Config.hlsl"
+#include "../Headers/HPacking.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+#include "../Includes/ScreenTraversal.hlsl"
+#include "../Includes/SpatialFilteringFunctions.hlsl"
+#include "../Includes/VoxelLightingEvaluation.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Material.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/BuiltinGIUtilities.hlsl"
+#include "Packages/com.unity.render-pipelines.core/Runtime/Lighting/ProbeVolume/ProbeVolume.hlsl"
+
+#define AO_IN_GBUFFER3_TAG float3((1 << 11), 1, (1 << 10))
+
+H_TEXTURE_UINT2(_HTraceStencilBuffer);
+H_TEXTURE(_ColorPyramid_History);
+H_TEXTURE(_NormalDepth_History);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_Radiance_History);
+H_TEXTURE(_GBufferTexture3);
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_DepthPyramid);
+H_TEXTURE(_RayDirection);
+H_TEXTURE(_HitCoord);
+H_TEXTURE(_ProbeSeed);
+
+H_RW_TEXTURE(float, _TracingTemporalValidity_Output);
+H_RW_TEXTURE(float4, _HitRadiance_Output);
+H_RW_TEXTURE(float3, _HitNormal_Output);
+H_RW_TEXTURE(uint, _HitDistance_Output);
+H_RW_TEXTURE(uint2, _HitCoord_Output);
+
+RWStructuredBuffer<uint2> _TracingCoords;
+RWStructuredBuffer<uint> _RayCounter;
+
+int _IndexXR;
+
+// ------------------------ FUNCTIONS ------------------------
+bool RadianceValidation(uint2 pixCoord, float3 HitPositionNDC, float3 RayDirectionWS, float3 HitPositionWS, float3 PositionWS, float Thickness, bool IsInsideVoxelBound, inout float3 HitRadiance)
+{       
+    // Reject hits outside the frame
+    if (all(HitPositionNDC.xy > 0) && all(HitPositionNDC.xy < 1))
+    {
+        float HitSurface = H_LOAD(_DepthPyramid, HitPositionNDC.xy * _ScreenSize.xy).x;
+
+        // Reject hits on sky (or other) infinitely distant pixels
+        if (HitSurface > 1e-7)
+        {
+            float HitSurfaceLinear = LinearEyeDepth(HitSurface, _ZBufferParams);
+            float HitDepthLinear = LinearEyeDepth(HitPositionNDC.z , _ZBufferParams);
+
+            // Reject hits that are too deep beneath the surface (or above it)
+            Thickness = IsInsideVoxelBound ? Thickness : 0.05f * max(HitSurfaceLinear, 0.00001f);
+            if (abs(HitDepthLinear - HitSurfaceLinear) < Thickness && HitSurfaceLinear < HitDepthLinear)
+            {
+                float3 HitNormal = H_LOAD(_GeometryNormal, HitPositionNDC.xy * _ScreenSize.xy).xyz;
+                float HitDistance = length(PositionWS - HitPositionWS);
+             
+                float2 ReprojectedHitNDC = HitPositionNDC.xy - HBUFFER_MOTION_VECTOR(HitPositionNDC.xy * _ScreenSize.xy).xy;
+                if (any(ReprojectedHitNDC < 0) || any(ReprojectedHitNDC > 1))
+                    return false;
+
+                // Load previous normal and depth
+                uint2 NormalDepthHistoryPacked = asuint(H_LOAD(_NormalDepth_History, ReprojectedHitNDC * _ScreenSize.xy).xy);
+                float4 NormalDepthReprojected = UnpackNormalDepthFull(NormalDepthHistoryPacked);
+                float3 HitNormalReprojected = NormalDepthReprojected.xyz;
+                float HitSurfaceReprojected = NormalDepthReprojected.w;
+                float HitSurfaceReprojectedLinear = LinearEyeDepth(HitSurfaceReprojected, _ZBufferParams);
+
+                // Accept previous color buffer based on depth and normal differences
+                float ReprojectionDepthWeight = PixelDepthWeighting(HitSurfaceReprojectedLinear, HitSurfaceLinear, 35);
+                float ReprojectionNormalWeight = dot(HitNormalReprojected, HitNormal);
+                if (ReprojectionDepthWeight <= 0 || ReprojectionNormalWeight < 0.25f)
+                    if (HitDistance > _VoxelSize) return false; else return true; 
+
+                // TODO: check if we can use higher LODs
+                int RadianceLOD = 0; //lerp(0, 4, saturate(HitDistance / 5.0f));
+                
+                // If the surface is hit from behind - skip reading color buffer and output zero
+                if (dot(RayDirectionWS, HitNormal) < 0)
+                {
+                    if (HIT_SCREEN_SPACE_LIGHTING)
+                    {
+                        _HitCoord_Output[H_COORD(pixCoord.xy)] = floor(HitPositionNDC.xy * _ScreenSize.xy);  
+                    }
+                    else
+                    {
+                        // Calculate dimming value proprtional to the viewing angle
+                        float3 HitToCameraDir = -normalize(GetAbsolutePositionWS(HitPositionWS) - _WorldSpaceCameraPos);
+                        float AngleDimming =(sqrt(sqrt(sqrt(dot(HitToCameraDir, HitNormal)))));
+                        
+                        HitRadiance = H_LOAD_LOD(_ColorPyramid_History, ReprojectedHitNDC * _ScreenSize.xy / pow(2, RadianceLOD), RadianceLOD).xyz;
+                        HitRadiance *= GetInversePreviousExposureMultiplier();
+                        HitRadiance *= AngleDimming;  
+                    }
+                }
+                
+                return true; 
+            }
+        }
+    }
+    
+    return false;
+}
+
+
+// ------------------------ SCREEN SPACE TRACING ------------------------
+[numthreads(8, 8, 1)]
+void ScreenSpaceTracing(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint IndirectCoordOffsetVR =  _ScreenSize.x * _ScreenSize.y * _IndexXR;
+    uint RayCounterOffsetVR = 10 * _IndexXR;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[0 + 4 + RayCounterOffsetVR])
+        return;
+  
+    pixCoord.xy = _TracingCoords[RayIndex + IndirectCoordOffsetVR];
+    
+    // Load normal, depth and offset
+    uint2 ProbeOffset;
+    float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy / _OctahedralSize).xy), ProbeOffset);
+
+    // Calculate probe coord
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    float2 ProbeCoordNDC = (ProbeCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw ; 
+
+    // Load center pixel data
+    float3 RayDirectionWS = H_LOAD(_RayDirection, pixCoord.xy).xyz * 2 - 1;
+    float3 PositionWS = ComputeWorldSpacePosition(ProbeCoordNDC.xy, NormalDepth.w, UNITY_MATRIX_I_VP);
+
+    // Calculate biased ray origin and ray directrion in NDC space
+    float3 RayStartPositionNDC, RayDirectionNDC; 
+    GetRayOriginAndDirectionNDC(NormalDepth.w, 50, ProbeCoordNDC.xy, PositionWS, RayDirectionWS, NormalDepth.xyz, RayStartPositionNDC, RayDirectionNDC);
+
+    // Raymarch Hi-Z depth buffer
+    float3 HitPositionNDC, LastAboveSurfacePositionNDC;
+    bool HitFound = HierarchicalRaymarch(_DepthPyramid, RayStartPositionNDC, RayDirectionNDC, 50, HitPositionNDC, LastAboveSurfacePositionNDC);
+    
+    if (HitFound)
+    {
+        // Center hit coord 
+        HitPositionNDC.xy = floor(HitPositionNDC.xy * _ScreenSize.xy) * _ScreenSize.zw + (0.5 * _ScreenSize.zw);
+        
+        // Calculate hit position in world space
+        float3 HitPositionWS = HitPositionNDC.z > 1e-7 ? ComputeWorldSpacePosition(HitPositionNDC.xy, HitPositionNDC.z, UNITY_MATRIX_I_VP) : PositionWS;
+        
+        // Evaluate occluder thickness
+        float Thickness = AdaptiveThicknessSearch(_DepthPyramid, HitPositionWS, RayDirectionWS);
+
+        // Check if ss ray's end is outside voxel bounds
+        bool IsInsideVoxelBound = IsWorldPositionInBounds(GetAbsolutePositionWS(HitPositionWS)); 
+        
+        float3 HitRadiance = 0;
+        bool HitIsValid = RadianceValidation(pixCoord.xy, HitPositionNDC, RayDirectionWS, HitPositionWS, PositionWS, Thickness, IsInsideVoxelBound, HitRadiance);
+        
+        // Calculate hit distance in world space
+        float HitDistanceWS = length(PositionWS - HitPositionWS);
+    
+        // If ss ray's end is outside voxel bounds - do not trace ws ray from there, use fallback
+        if (IsInsideVoxelBound == false)
+        {
+            // We use fallback only if ss ray failed
+            if (!HitIsValid)
+            {
+                // Use APV as fallback if avilable
+                if (_EnableProbeVolumes)
+                {
+                    if (APV_FALLBACK && (PROBE_VOLUMES_L1 || PROBE_VOLUMES_L2))
+                    {
+                        float3 Unused = 0.0;
+                        EvaluateAdaptiveProbeVolume(GetAbsolutePositionWS(PositionWS), NormalDepth.xyz, -NormalDepth.xyz, GetWorldSpaceNormalizeViewDir(PositionWS), 100, HitRadiance, Unused);
+                    }
+                }
+                //Use skybox as fallback and dim it with sky occlusion approximation
+                else if (dot(float3(0,1,0), RayDirectionWS) > _SkyOcclusionCone + 0.05f)
+                {
+                    float SkyOcclusion = EvaluateDirectionalShadowOcclusion(GetAbsolutePositionWS(HitPositionWS));
+                    HitRadiance = SAMPLE_TEXTURECUBE_ARRAY_LOD(_SkyTexture, H_SAMPLER_TRILINEAR_CLAMP, RayDirectionWS.xyz, 0, 2).xyz * SkyOcclusion * SKY_LIGHT_INTENSITY;
+                }
+            }
+            
+            HitIsValid = true;
+        }
+
+        // Tracing toggles
+        if (DISABLE_SS_TRACING) { HitIsValid = false; HitDistanceWS = 0; }
+        if (DISABLE_WS_TRACING) { HitIsValid = true; }
+        
+        // If the ray went outside the frame but travelled a short distance - it may be unreliable (important for probe ao)
+        bool IsOutsideFrame = false;
+        if ((any(HitPositionNDC.xy > 0.99) || any(HitPositionNDC.xy < 0.01)) && HitDistanceWS < _VoxelSize.x)
+            IsOutsideFrame = true;
+        
+        _HitRadiance_Output[H_COORD(pixCoord.xy)] = float4(HitRadiance, 1);
+        _HitDistance_Output[H_COORD(pixCoord.xy)] = PackHitDistance(max(HitDistanceWS, 0.001f), IsOutsideFrame, !HitIsValid);
+
+       // _HitRadiance_Output [H_COORD(pixCoord.xy)] = float4(HitRadiance.xyz, 1);
+    }
+}
+
+
+// ------------------------ SCREEN SPACE HIT LIGHTING EVALUATION ------------------------
+[numthreads(8, 8, 1)]
+void LightEvaluation(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint IndirectCoordOffsetVR =  _ScreenSize.x * _ScreenSize.y * _IndexXR;
+    uint RayCounterOffsetVR = 10 * _IndexXR;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[0 + 4 + RayCounterOffsetVR])
+        return;
+  
+    pixCoord.xy = _TracingCoords[RayIndex + IndirectCoordOffsetVR];
+
+    // Load hit coords
+    uint2 HitCoord = asuint(H_LOAD(_HitCoord, pixCoord.xy).xy);
+    float2 HitCoordNDC = (HitCoord + 0.5f) * _ScreenSize.zw;
+
+    // Hit validation in screen tracing shader failed, early out;
+    if (HitCoord.x + HitCoord.y <= 0)
+        return;
+
+    // Compute reprojected hit coords (for those buffers that come from previous frames)
+    float2 HitCoordReprojectedNDC = HitCoordNDC - HBUFFER_MOTION_VECTOR(HitCoordNDC.xy * _ScreenSize.xy);
+    uint2 HitCoordReprojected = HitCoordReprojectedNDC * _ScreenSize.xy;
+    
+    // Load gbuffer data at hit point
+    float3 HitNormal = HBUFFER_NORMAL_WS(HitCoord).xyz;
+    float3 HitDiffuse = HBUFFER_DIFFUSE(HitCoord).xyz;
+
+    float3 HitColor = 0;
+
+    // If diffuse is 0 - use color buffer directly instead. TODO: consider metallics
+    if (HitDiffuse.x + HitDiffuse.y + HitDiffuse.z == 0)
+    {
+        // Load color buffer
+        HitColor = H_LOAD(_ColorPyramid_History, HitCoordReprojected).xyz * GetInverseCurrentExposureMultiplier();
+    
+        // Calculate additional gbuffer data at hit point
+        float HitDepth = HBUFFER_DEPTH(HitCoord);
+        float3 HitNormal = H_LOAD(_GeometryNormal, HitCoord).xyz;
+        float3 HitPosition = ComputeWorldSpacePosition(HitCoordNDC.xy, HitDepth, UNITY_MATRIX_I_VP);
+        float3 HitToCameraDir = -normalize(GetAbsolutePositionWS(HitPosition) - _WorldSpaceCameraPos);
+        
+        // Calculate dimming value proprtional to the viewing angle
+        HitColor *= sqrt(sqrt(sqrt(sqrt(dot(HitToCameraDir, HitNormal)))));
+        
+        _HitRadiance_Output[H_COORD(pixCoord.xy)] = float4(HitColor, 1);
+        return;
+    }
+    
+    // Add directional light contribution
+    if (_DirectionalLightCount > 0)
+    {
+        DirectionalLightData DirectionalLightData = _DirectionalLightDatas[0];
+
+        float NdotL = saturate(dot(HitNormal, -DirectionalLightData.forward));
+        
+        if (NdotL > 0)
+        {   
+            HitColor += HitDiffuse;
+            HitColor *= DirectionalLightData.color * DIRECTIONAL_LIGHT_INTENSITY;
+            HitColor *= H_LOAD(_ScreenSpaceShadowsTexture, HitCoordReprojected).x;
+            HitColor *= NdotL;
+            HitColor /= H_PI;
+        }
+    }
+    
+    // Add emissive contribution
+    float3 Emissive = H_LOAD(_GBufferTexture3, HitCoord).xyz;
+    if (any(Emissive.xz != AO_IN_GBUFFER3_TAG.xz))
+    {
+        HitColor = Emissive;
+        bool Unused;
+        uint HitColorPacked = PackVoxelColor(HitColor, true);
+        HitColor = UnpackVoxelColor(HitColorPacked, Unused);
+
+        HitColor *= GetInverseCurrentExposureMultiplier();
+    }
+
+    // Add indirect lighting contribution (via reprojected screen space radiance cache)
+    HitColor += H_LOAD(_Radiance_History, HitCoordReprojected).xyz * GetInversePreviousExposureMultiplier() * HitDiffuse;
+    
+    _HitRadiance_Output[H_COORD(pixCoord.xy)] = float4(HitColor, 1);
+}

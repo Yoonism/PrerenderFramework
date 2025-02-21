@@ -1,0 +1,22 @@
+{
+    "name": "MK.Glow.HDRP.Editor",
+    "references": [
+        "GUID:78bd2ddd6e276394a9615c203e574844",
+        "GUID:bf0220fd1bb918740b112a52cefae584",
+        "GUID:457756d89b35d2941b3e7b37b4ece6f1",
+        "GUID:cb19445e095596046a336416b28b0cc9",
+        "GUID:3eae0364be2026648bf74846acb8a731",
+        "GUID:df380645f10b7bc4b97d4f5eb6303d95"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

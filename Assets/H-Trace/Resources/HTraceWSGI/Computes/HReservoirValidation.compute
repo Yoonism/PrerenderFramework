@@ -1,0 +1,310 @@
+#pragma kernel OcclusionValidation
+#pragma kernel OcclusionReprojection
+#pragma kernel OcclusionSpatialFilter
+#pragma kernel OcclusionTemporalFilter
+
+#pragma warning (disable : 3206)
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/Reservoir.hlsl"
+#include "../Includes/ScreenTraversal.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/RenderPass/CustomPass/CustomPassCommon.hlsl"
+
+H_TEXTURE(_SampleCount);
+H_TEXTURE(_DepthPyramid);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_ShadowGuidanceMask);
+H_TEXTURE(_ReprojectionCoords);
+H_TEXTURE(_SampleCount_History);
+H_TEXTURE(_ReprojectionWeights);
+H_TEXTURE(_ProbeAmbientOcclusion);
+H_TEXTURE(_ShadowGuidanceMask_History);
+
+H_TEXTURE_ARRAY(_SpatialWeightsPacked);
+H_TEXTURE_ARRAY(_SpatialOffsetsPacked);
+
+H_TEXTURE(_ShadowGuidanceMaskTest);
+
+H_RW_TEXTURE(float, _SampleCount_Output);
+H_RW_TEXTURE(float, _ShadowGuidanceMask_Output);
+
+RWStructuredBuffer<uint> _RayCounter;
+RWStructuredBuffer<uint2> _TracingCoords;
+StructuredBuffer<float2> _PointDistribution;
+
+int _IndexXR;
+int _PersistentHistorySamples;
+
+// ------------------------ OCCLUSION CHECKERBOARD REPROJECTION -----------------------
+[numthreads(8, 8, 1)]
+void OcclusionReprojection(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Calculate probe coords
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+
+    // Get reprojection coords for previous frame
+    uint2 BestOffset; bool ReprojectionFailed;
+    uint2 ReprojectionCoordPacked = asuint(H_LOAD(_ReprojectionCoords, ProbeCoord)).xy;
+    uint2 ReprojectionCoord = UnpackBestReprojectionCoord(ReprojectionCoordPacked, BestOffset, ReprojectionFailed);
+    
+    ReprojectionCoord = ReprojectionCoord * _OctahedralSize + BestOffset * _OctahedralSize + CellCoord;
+    
+    // Reproject if possible, otherwise use probe ambient occlusion as a fallback instead
+    if (!ReprojectionFailed && all((float2)ReprojectionCoord < _ScreenSize.xy / _ProbeSize * _OctahedralSize) && all(ReprojectionCoord > 0))
+    {
+        _ShadowGuidanceMask_Output[H_COORD(pixCoord.xy)] = H_LOAD(_ShadowGuidanceMask_History, ReprojectionCoord).x;
+    }
+    else
+    {
+        _ShadowGuidanceMask_Output[H_COORD(pixCoord.xy)] = 0; //H_LOAD(_ProbeAmbientOcclusion, ProbeCoord);
+    } 
+}
+
+
+// ------------------------ OCCLUSION VALIDATION -----------------------
+[numthreads(8, 8, 1)]
+void OcclusionValidation(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint IndirectCoordOffsetVR =  _ScreenSize.x * _ScreenSize.y * _IndexXR;
+    uint RayCounterOffsetVR = 10 * _IndexXR;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[1 + 4 + RayCounterOffsetVR])
+        return;
+  
+    pixCoord.xy = _TracingCoords[RayIndex + IndirectCoordOffsetVR];
+    
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+    
+    // Load probe normal, depth & offset
+    uint2 ProbeOffset;
+    float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, ProbeCoord).xy), ProbeOffset);
+    float2 ProbeCoordNDC = (ProbeCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw; 
+    
+    // Get reprojection coords for previous frame
+    uint2 BestOffset; bool ReprojectionFailed;
+    uint2 ReprojectionCoordPacked = asuint(H_LOAD(_ReprojectionCoords, ProbeCoord).xy);
+    uint2 ReprojectionCoord = UnpackBestReprojectionCoord(ReprojectionCoordPacked, BestOffset, ReprojectionFailed);
+    ReprojectionCoord = ReprojectionCoord * _OctahedralSize + BestOffset * _OctahedralSize + CellCoord;
+    
+    // Initialize center reservoir
+    Reservoir ReprojectedReservoir;
+    ReservoirInitialize(pixCoord.xy, ReprojectedReservoir);
+    
+    // Load ray data
+    uint2 RayDataPacked = asuint(H_LOAD(_ReservoirAtlasRayData, ReprojectionCoord).xy);
+    if (ReprojectionFailed) 
+        RayDataPacked = asuint(H_LOAD(_ReservoirAtlasRayData_Disocclusion, pixCoord.xy).xy); 
+    
+    // Unpack ray data
+    UnpackRayData(RayDataPacked, ReprojectedReservoir.Ray);
+    
+    // Get max ray distance for tracing
+    float OcclusionTracingDistance = min(MAX_OCCLUSION_TRACING_DISTANCE, ReprojectedReservoir.Ray.Distance);
+
+    // Initialize both screen-space and world-space hits to false
+    bool HitFoundWS = false;
+    bool HitFoundSS = false;
+    
+    // Load center pixel data
+    float3 RayDirectionWS = ReprojectedReservoir.Ray.Direction;
+    float3 PositionWS = ComputeWorldSpacePosition(ProbeCoordNDC.xy, NormalDepth.w, UNITY_MATRIX_I_VP);
+    
+    // Calculate biased ray origin and ray directrion in NDC space
+    float3 RayStartPositionNDC, RayDirectionNDC; 
+    GetRayOriginAndDirectionNDC(NormalDepth.w, OcclusionTracingDistance, ProbeCoordNDC, PositionWS, RayDirectionWS, NormalDepth.xyz, RayStartPositionNDC, RayDirectionNDC);
+
+    // Raymarch Hi-Z depth buffer
+    float3 HitPositionNDC, LastAboveSurfacePositionNDC;
+    HierarchicalRaymarch(_DepthPyramid, RayStartPositionNDC, RayDirectionNDC, 30, HitPositionNDC, LastAboveSurfacePositionNDC);
+    HitPositionNDC.xy = floor(HitPositionNDC.xy * _ScreenSize.xy) * _ScreenSize.zw + (0.5 * _ScreenSize.zw);
+    
+    // Get hit point depth, position & ray distance
+    float3 HitPositionWS = HitPositionNDC.z > 1e-7 ? ComputeWorldSpacePosition(HitPositionNDC.xy, HitPositionNDC.z, UNITY_MATRIX_I_VP) : PositionWS;
+    float HitSurfaceLinear = LinearEyeDepth(H_LOAD(_DepthPyramid, HitPositionNDC.xy * _ScreenSize.xy).x, _ZBufferParams);
+    float HitDepthLinear = LinearEyeDepth(HitPositionNDC.z , _ZBufferParams);
+    float HitDistanceWS = length(PositionWS - HitPositionWS);
+    
+    // Evaluate occluder thickness
+    float Thickness = AdaptiveThicknessSearch(_DepthPyramid, HitPositionWS, RayDirectionWS);
+
+    // Evaluate validity of the screen-space hit
+    if (abs(HitDepthLinear - HitSurfaceLinear) < Thickness && HitDepthLinear > HitSurfaceLinear)
+        HitFoundSS = true;
+
+    // Initialize voxel ray payload
+    VoxelPayload Payload;
+    InitializePayload(Payload);
+    
+    // If our screen-space hit is invalid and the remaining tracing distance is larger than a voxel - continue in world-space
+    if (HitFoundSS != true && HitDistanceWS < OcclusionTracingDistance - _VoxelSize)
+    {
+        // Start world space tracing where the screen space part finished
+        float3 RayOriginWS = PositionWS + HitDistanceWS * RayDirectionWS;
+
+        //If the ray travelled less than half a voxel - reset it to origin
+        if (HitDistanceWS <= _VoxelSize * 0.5f)
+        {
+            RayOriginWS = PositionWS;
+            HitDistanceWS = 0;
+        }
+
+        // Apply voxel bias
+        VoxelBias(pixCoord.xy, _DepthPyramid, _PointDistribution, NormalDepth.w, HitDistanceWS, NormalDepth.xyz, RayDirectionWS, RayOriginWS);
+        
+        // Trace into Voxels
+        HitFoundWS = TraceVoxelsOcclusion(RayOriginWS, RayDirectionWS.xyz, OcclusionTracingDistance - HitDistanceWS, 50, Payload.HitDistance);
+
+        // If hit wasn't found
+        if (!HitFoundWS)
+          Payload.HitDistance = OcclusionTracingDistance;
+        
+        HitDistanceWS += Payload.HitDistance;
+    }
+    
+    float ShadowGuidanceMask = 1;
+
+    // If we have a hit either in screen-space or in world-space
+    if (HitFoundWS || HitFoundSS)
+    {
+        // If the distance difference is relatively high
+        if (abs(HitDistanceWS - ReprojectedReservoir.Ray.Distance) / (ReprojectedReservoir.Ray.Distance + ReprojectedReservoir.Ray.Distance) > 0.25)
+        {   
+            ShadowGuidanceMask = lerp(0, 1, saturate(HitDistanceWS / OcclusionTracingDistance));
+        }
+    }
+
+    // This helps to hide voxel artifacts which appear when ss rays go behind surfaces or offscreen
+    if (HitDistanceWS <= _VoxelSize.x && !HitFoundSS)
+        ShadowGuidanceMask = lerp(1, ShadowGuidanceMask, saturate(length(PositionWS) / 5.0f));
+
+    // if (ReprojectionFailed) // && (pixCoord.y / 4 * 6 > _ScreenSize.y * 0.5)) 
+    //     ShadowGuidanceMask = 1; //H_LOAD(_ProbeAmbientOcclusion, ProbeCoord); 
+    //
+    
+    // Output
+     _ShadowGuidanceMask_Output[H_COORD(pixCoord.xy)] = ShadowGuidanceMask;
+}
+
+
+// ------------------------ OCCLUSION TEMPORAL FILTER ----------------------
+[numthreads(8, 8, 1)]
+void OcclusionTemporalFilter(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Calculate probe coords
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+
+    // Load reprojection coords and weights
+    int2 ReprojectionCoord = UnpackReprojectionCoord(asuint(H_LOAD(_ReprojectionCoords, ProbeCoord)).xy);
+    float4 ReprojectionWeights = H_LOAD(_ReprojectionWeights, ProbeCoord);
+    
+    // Normalize reprojection weights
+    float WeightsSumm = max(ReprojectionWeights.x + ReprojectionWeights.y + ReprojectionWeights.z + ReprojectionWeights.w, 1.0e-3);
+    ReprojectionWeights /= WeightsSumm;
+    
+    // Reproject samplecount
+    float4 SampleCountHistory;
+    SampleCountHistory.x = H_LOAD(_SampleCount_History, ReprojectionCoord).x * ReprojectionWeights.x;
+    SampleCountHistory.y = H_LOAD(_SampleCount_History, ReprojectionCoord).x * ReprojectionWeights.y;
+    SampleCountHistory.z = H_LOAD(_SampleCount_History, ReprojectionCoord).x * ReprojectionWeights.z;
+    SampleCountHistory.w = H_LOAD(_SampleCount_History, ReprojectionCoord).x * ReprojectionWeights.w;
+    float SampleCountReprojected = SampleCountHistory.x + SampleCountHistory.y + SampleCountHistory.z + SampleCountHistory.w;
+
+    // Reproject shadow guidance mask
+    float4 ShadowGuidanceMaskHistory;
+    ShadowGuidanceMaskHistory.x = H_LOAD(_ShadowGuidanceMask_History, ReprojectionCoord * _OctahedralSize + uint2(0, 0) * _OctahedralSize + CellCoord).x * ReprojectionWeights.x;
+    ShadowGuidanceMaskHistory.y = H_LOAD(_ShadowGuidanceMask_History, ReprojectionCoord * _OctahedralSize + uint2(1, 0) * _OctahedralSize + CellCoord).x * ReprojectionWeights.y;
+    ShadowGuidanceMaskHistory.z = H_LOAD(_ShadowGuidanceMask_History, ReprojectionCoord * _OctahedralSize + uint2(0, 1) * _OctahedralSize + CellCoord).x * ReprojectionWeights.z;
+    ShadowGuidanceMaskHistory.w = H_LOAD(_ShadowGuidanceMask_History, ReprojectionCoord * _OctahedralSize + uint2(1, 1) * _OctahedralSize + CellCoord).x * ReprojectionWeights.w;
+    float ShadowGuidanceMaskReprojected = ShadowGuidanceMaskHistory.x + ShadowGuidanceMaskHistory.y + ShadowGuidanceMaskHistory.z +  ShadowGuidanceMaskHistory.w;
+    
+    // Update samplecount
+    float SampleCount = min(MAX_OCCLUSION_TEMPORAL_SAMPLES, SampleCountReprojected + 1);
+    float TemporalWeight = 1.0f - (1.0f / float(SampleCount));
+    
+    // Temporally accumulate shadow guidance mask
+    float ShadowGuidanceMask = H_LOAD(_ShadowGuidanceMask, pixCoord.xy).x;
+    ShadowGuidanceMask = lerp(ShadowGuidanceMask, ShadowGuidanceMaskReprojected, TemporalWeight);
+    
+    // Output
+    _ShadowGuidanceMask_Output[H_COORD(pixCoord.xy)] = ShadowGuidanceMask;
+    _SampleCount_Output[H_COORD(pixCoord.xy / _OctahedralSize)] = SampleCount; 
+}
+
+
+// ------------------------ OCCLUSION SPATIAL FILTER -----------------------
+[numthreads(8, 8, 1)]
+void OcclusionSpatialFilter(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Calculate probe and cell coord
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+    
+    // Unpack occlusion (passed with packed radiance data)
+    float ShadowGuidanceMask = H_LOAD(_ShadowGuidanceMask, pixCoord.xy).x;
+    float WeightAccumualated = 1;
+
+    // Scale filter weight based on the accumulated samplecount
+    float SampleCount = H_LOAD(_SampleCount, ProbeCoord).x;
+    float SpatialWeight = lerp(1, 0, (SampleCount / 16));
+
+    // Load packed sample weights and coords
+    float SampleWeights[8]; int2 SampleOffsets[8];
+    uint4 PackedSampleOffsets = asuint(H_LOAD_ARRAY(_SpatialOffsetsPacked, ProbeCoord, 0));
+    uint4 PackedSampleWeights = asuint(H_LOAD_ARRAY(_SpatialWeightsPacked, ProbeCoord, 0));
+    
+    // Unpack sample weights and coords
+    UnpackFilteringOffsetsX8(PackedSampleOffsets, SampleOffsets);
+    UnpackFilteringWeightsX8(PackedSampleWeights, SampleWeights);
+    
+    for (int i = 0; i < 8; i++)
+    {
+        int2 CellTapCoord = ProbeCoord * _OctahedralSize + SampleOffsets[i] * _OctahedralSize + CellCoord;
+        ShadowGuidanceMask += H_LOAD(_ShadowGuidanceMask, CellTapCoord).x * SampleWeights[i] * SpatialWeight;
+        WeightAccumualated += SampleWeights[i] * SpatialWeight;
+    }  
+   
+    ShadowGuidanceMask /= WeightAccumualated;
+    
+    // Load packed reservoir with radiance data
+    uint2 RadianceDataPacked = asuint(H_LOAD(_ReservoirAtlasRadianceData_Inout, pixCoord.xy).xy);
+
+    bool TemporalInvalidation;
+    UnpackOcclusion(RadianceDataPacked.x, TemporalInvalidation);
+
+    RadianceDataPacked.x &= 0xFFFFFF;
+
+    float Gathered;
+    int2 TestCoord = floor(pixCoord.xy / _OctahedralSize);
+    // for (int x = 0; x < 4; x++)
+    // {
+    //     for (int y = 0; y < 4; y++)
+    //     {
+    //         Gathered += H_LOAD(_ShadowGuidanceMask, TestCoord * 4 + int2(x,y));
+    //     }
+    // }
+
+    Gathered /= 16.0f;
+
+    // if (SampleCount == 1)
+    //     ShadowGuidanceMask = 1;
+    
+    // Combine radiance data with shadow guidance mask
+    RadianceDataPacked.x |= PackOcclusion(ShadowGuidanceMask, TemporalInvalidation);
+
+    // Output for reservoir spatial reuse
+    _ReservoirAtlasRadianceData_Inout[H_COORD(pixCoord.xy)] = RadianceDataPacked.xy;
+
+    _ShadowGuidanceMask_Output[H_COORD(pixCoord.xy)] = ShadowGuidanceMask;
+}

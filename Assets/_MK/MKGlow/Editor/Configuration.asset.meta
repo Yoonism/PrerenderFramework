@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 75ec4485385a80f42adc8a48e65e7a97
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Editor/Configuration.asset
+  uploadId: 705540

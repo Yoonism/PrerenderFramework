@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: a91029845e9288045bd5e0ba548399ea
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Sample Scene (Cornell Box)/Cornell Box Volume Profile.asset
+  uploadId: 728261

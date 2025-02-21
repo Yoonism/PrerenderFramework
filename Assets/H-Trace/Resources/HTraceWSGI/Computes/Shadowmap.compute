@@ -1,0 +1,20 @@
+﻿#pragma kernel ShadowmapMerge
+
+#include "../Headers/HMain.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/TextureXR.hlsl"
+
+H_TEXTURE_DX(float, _Shadowmap);
+RW_TEXTURE2D(float, _Shadowmap_Output);
+
+float2 _OctantShadowOffset;
+
+[numthreads(8, 8, 1)]
+void ShadowmapMerge(uint3 pixCoord : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID)
+{
+    int2 ShadowmapSize = int2(2048, 2048);
+    int2 WriteCoord = pixCoord.xy + _OctantShadowOffset.xy;
+    
+    float ShadowmapOctant = H_LOAD(_Shadowmap, pixCoord.xy).x;
+    
+    _Shadowmap_Output[WriteCoord] = ShadowmapOctant;
+}

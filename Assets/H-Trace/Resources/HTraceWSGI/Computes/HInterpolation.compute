@@ -1,0 +1,266 @@
+#pragma kernel GatherSH
+#pragma kernel Interpolation
+
+#pragma multi_compile _ USE_DIRECTIONAL_OCCLUSION
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/Reservoir.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+#include "../Includes/SpatialFilteringFunctions.hlsl"
+#include "../Includes/SphericalHarmonics.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/Raytracing/Shaders/RaytracingSampling.hlsl"
+
+H_TEXTURE(_ShadowGuidanceMask);
+
+H_TEXTURE(_ProbeSSAO);
+H_TEXTURE(_PackedSH_A);
+H_TEXTURE(_PackedSH_B);
+H_TEXTURE(_BentNormalsAO);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_GeometryNormal);
+
+H_TEXTURE(_Temp);
+
+H_RW_TEXTURE(uint, _Radiance_Output);
+H_RW_TEXTURE(uint4, _PackedSH_A_Output);
+H_RW_TEXTURE(uint4, _PackedSH_B_Output);
+
+float _AO_Intensity;
+
+// ------------------------ SH GATHER -----------------------
+[numthreads(8, 8, 1)]
+void GatherSH(uint3 pixCoord : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Initialize SH storage
+    SH_L2_Color CoefficientsSH;
+    InitializeSH(CoefficientsSH);
+
+    uint2 Unused;
+    float3 Normal = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy)).xy, Unused).xyz;
+    
+    // Accumulate all cells to SH
+    for (int x = 0; x < _OctahedralSize; x++)
+    {
+        for (int y = 0; y < _OctahedralSize; y++)
+        {
+            int2 TapCoord = pixCoord.xy * _OctahedralSize + uint2(x,y);
+
+            // Load packed radiance data reservoir
+            uint2 RadianceDataPacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, TapCoord).xy);
+
+            // Unpack radiance and W
+            float3 ReservoirRadiance = UnpackTonemappedColor24bit(RadianceDataPacked.x);
+            float ReservoirW = f16tof32(RadianceDataPacked.y >> 16);
+            
+            // Calculate octahedral ray direction
+            float3 RayDirection = OrientedOctahedronToDirection((float2(x, y) + 0.5f) / float(_OctahedralSize), Normal);
+
+            // Use reservoir ray direction instead (optional)
+            if (USE_RESERVOIR_RAY_DIRECTION)
+            {
+                uint2 RayDataPacked = asuint(H_LOAD(_ReservoirAtlasRayData, TapCoord).xy);
+                RayDirection = UnpackDirection24bit(RayDataPacked.x); 
+            }
+
+            // Add radiance to SH
+            AddSampleSH(CoefficientsSH, RayDirection, ReservoirRadiance * ReservoirW * 2.0f);
+        }
+    }
+    
+    // Normalize SH coefficients
+    CoefficientsSH.R.V0 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.R.V1 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.R.V2 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.G.V0 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.G.V1 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.G.V2 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.B.V0 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.B.V1 /= float(_OctahedralSize * _OctahedralSize);
+    CoefficientsSH.B.V2 /= float(_OctahedralSize * _OctahedralSize);
+
+    // Pack SH coefficients
+    uint4 PackedSH_A, PackedSH_B;
+    PackInterpolationSH(PackedSH_A, PackedSH_B, CoefficientsSH);
+    
+    _PackedSH_A_Output[H_COORD(pixCoord.xy)] = PackedSH_A;
+    _PackedSH_B_Output[H_COORD(pixCoord.xy)] = PackedSH_B;
+}
+
+
+// ------------------------ INTERPOLATION KERNEL ------------------------
+[numthreads(8,8,1)]
+void Interpolation(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Load center full-res depth
+    float DepthCenter = HBUFFER_DEPTH(pixCoord.xy);
+
+    // Early-out on the skybox
+    if (DepthCenter <= 1e-7)
+    {   
+        _Radiance_Output[H_COORD(pixCoord.xy)] = 0;
+        return;
+    }
+    
+    float2 pixCoordNDC = (pixCoord.xy + 0.5f) * _ScreenSize.zw;
+    int2 InterpolationCoord = pixCoord.xy;
+
+    // Load and prepare other center full-res data
+    float DepthLinearCenter = LinearEyeDepth(DepthCenter, _ZBufferParams);
+    float3 GeometryNormalCenter = H_LOAD(_GeometryNormal, pixCoord.xy).xyz;
+    float3 WorldPosCenter = ComputeWorldSpacePosition(pixCoordNDC, DepthCenter, UNITY_MATRIX_I_VP);
+    float4 NormalPlane = float4(GeometryNormalCenter, dot(WorldPosCenter, GeometryNormalCenter));
+
+    // Get interpolation jitter to hide grid-like artifacts
+    float2 Jitter;
+    Jitter.x = GetBNDSequenceSample(pixCoord.xy, uint(_FrameCount) % 16, 7);
+    Jitter.y = GetBNDSequenceSample(pixCoord.xy, uint(_FrameCount) % 16, 8);
+    float2 InterpolationJitter =  Jitter.xy * float(_ProbeSize);
+    // float2 InterpolationJitter = (Jitter.xy * 2 - 1 ) * float(_ProbeSize / 2);
+
+    // Jitter interpolation coords and calculate jittered position at these coords
+    float2 JitteredCoord = pixCoord.xy + InterpolationJitter;
+    float3 JitteredWorldPos = ComputeWorldSpacePosition((JitteredCoord + 0.5f) * _ScreenSize.zw, HBUFFER_DEPTH(JitteredCoord), UNITY_MATRIX_I_VP);
+
+    // Use the jittered position only if it's on the same plane with our initial positon 
+    if (ProbePlaneWeighting(NormalPlane, JitteredWorldPos, LinearEyeDepth(DepthCenter, _ZBufferParams), 10000.0f) > 0.01) 
+    {
+        InterpolationCoord = JitteredCoord;
+    }
+
+    float4 BentNormalsSSAO = 0;
+    float CosThetaSSAO = 0;
+    float CenterSSAO = 0;
+    
+    // Use bent normals and ssao to evaluate directional occlusion and assist interpolation
+    if (USE_DIRECTIONAL_OCCLUSION)
+    {
+        BentNormalsSSAO = H_LOAD(_BentNormalsAO, pixCoord.xy);
+        CosThetaSSAO = lerp(1.0f - BentNormalsSSAO.w, 1 - acos(sqrt(saturate(1.0f - BentNormalsSSAO.w))), 0.5);
+        CenterSSAO = BentNormalsSSAO.w;
+    }
+
+    // Prepare 5x5 spatial offsets for interpolation search
+    int2 SampleOffsets[25] = {int2( 0,  0), int2( 0,  1), int2( 1,  0), int2( 1,  1), int2(-1,  0), int2(-1,  1), int2(-1, -1), int2( 0, -1), int2( 1, -1),
+                              int2(-2,  0), int2( 0, -2), int2( 2,  0), int2( 0,  2), int2(-1,  2), int2(-2,  1), int2( 1, -2), int2( 2, -1),
+                              int2(-2, -1), int2(-1, -2), int2( 2,  1), int2( 1,  2), int2(-2,  2), int2( 2,  2), int2( 2, -2), int2(-2,  2)};
+
+    // Initialize interpolation sample weights with zero
+    float SampleWeights[INTERPOLATION_SAMPLES];
+
+    for (int s = 0; s < INTERPOLATION_SAMPLES; s++)
+    {
+        SampleWeights[s] = 0;
+    }
+    
+    // Do the interpolation search
+    for (int i = 0; i < INTERPOLATION_SAMPLES; i++)
+    {
+        // Calculate sample coord
+        int2 TapCoord = floor(uint2(InterpolationCoord) / _ProbeSize) + SampleOffsets[i];
+
+        // Load sample low-res normal, depth & SSAO
+        uint2 ProbeOffset;
+        float4 NormalDepthSample = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, TapCoord)).xy, ProbeOffset);
+        
+        // Calculate low-res world position
+        float2 TapCoordNDC = (TapCoord * float(_ProbeSize) + float2(ProbeOffset) + 0.5f / float(_ProbeSize)) * _ScreenSize.zw;
+        float3 WorldPosSample = ComputeWorldSpacePosition(TapCoordNDC, NormalDepthSample.w, UNITY_MATRIX_I_VP);
+
+        // Calculate spatial sample weights
+        float WeightPlane = ProbePlaneWeighting(NormalPlane, WorldPosSample, DepthLinearCenter, 10000);
+        float WeightNormal = saturate(dot(NormalDepthSample.xyz, GeometryNormalCenter));
+
+        float PixelDistanceWeight = distance(float2(pixCoord.xy), (float2(TapCoord * _ProbeSize) + float2(ProbeOffset))) / (float(_ProbeSize + _ProbeSize) - 1.0f);
+        PixelDistanceWeight = 1 - PixelDistanceWeight;
+        
+        // Combine all weights and store
+        SampleWeights[i] = WeightPlane * WeightNormal * PixelDistanceWeight;
+
+        if (USE_DIRECTIONAL_OCCLUSION)
+        {
+            float SampleSSAO = H_LOAD(_ProbeSSAO, TapCoord).x;
+            float WeightSSAO = exp2(-20.0 * abs(pow(SampleSSAO, 2) - pow(CenterSSAO, 2)));
+            SampleWeights[i] *= WeightSSAO;
+        }
+    }
+
+    // Stochastically pick one sample
+    int2 SelectedSampleOffset = 0;
+    float RandomValue = GetBNDSequenceSample(pixCoord.xy, uint(_FrameCount) % 16, 5);
+    
+    float WeightSumm = 0;
+    for (int t = 0; t < INTERPOLATION_SAMPLES; t++)
+    {
+        WeightSumm += SampleWeights[t];
+    }
+  
+    RandomValue *= WeightSumm;
+    
+    UNITY_UNROLL
+    for (int k = INTERPOLATION_SAMPLES; k > 0; k--)
+    {
+         float WeightSumm = 0;
+
+         UNITY_UNROLL
+         for (int j = 0; j < k - 1; j++)
+         {
+             WeightSumm += SampleWeights[j];
+         }
+         
+         if (RandomValue >= WeightSumm)
+         {
+             SelectedSampleOffset = SampleOffsets[k - 1];
+             break;
+         }
+    }
+    
+    // Select normal that will be used for interpolation
+    float3 InterpolationNormal = HBUFFER_NORMAL_WS(pixCoord.xy); 
+    if (USE_DIRECTIONAL_OCCLUSION)
+    {
+        InterpolationNormal = BentNormalsSSAO.w > 0.8 ? lerp(BentNormalsSSAO.xyz, InterpolationNormal, BentNormalsSSAO.w) : BentNormalsSSAO.xyz; 
+    }
+    
+    // Boost normal map details (be careful, it's just an approximation)
+    if (INTERPOLATION_NORMAL_BOOST > 1)
+    {
+        float3 NormalOriginal = InterpolationNormal;
+        float3 NormalDifference = NormalOriginal - GeometryNormalCenter;
+        
+        NormalDifference *= INTERPOLATION_NORMAL_BOOST;
+        InterpolationNormal = (NormalDifference + GeometryNormalCenter);
+        
+        if (dot(normalize(NormalDifference + GeometryNormalCenter), NormalOriginal) > 0.97)
+            InterpolationNormal = NormalOriginal;
+
+        if (USE_DIRECTIONAL_OCCLUSION)
+            InterpolationNormal = lerp(NormalOriginal, InterpolationNormal, pow(BentNormalsSSAO.w, 3));
+    }
+    
+    // Calculate final interpolation coord
+    InterpolationCoord = floor(uint2(InterpolationCoord) / _ProbeSize) + SelectedSampleOffset;
+
+    // Bypass interpolation (for debug)
+    if (DISABLE_INTERPOLATION)
+    {
+        InterpolationCoord = floor(pixCoord.xy / _ProbeSize);
+        InterpolationNormal = UnpackNormal(asuint(H_LOAD(_ProbeNormalDepth, InterpolationCoord).xy));
+    }
+    
+    // Load packed SH coefficients
+    uint4 PackedSH_A = asuint(H_LOAD(_PackedSH_A, InterpolationCoord));
+    uint4 PackedSH_B = asuint(H_LOAD(_PackedSH_B, InterpolationCoord));
+
+    // Unpack SH coefficients
+    SH_L2_Color LightingSH;
+    UnpackInterpolationSH(PackedSH_A, PackedSH_B, LightingSH);
+
+    // Evaluate SH coefficients to get the final lighting
+    float3 RadianceInterpolated = EvaluateSHIrradiance(InterpolationNormal.xyz, CosThetaSSAO, LightingSH);
+    
+   _Radiance_Output[H_COORD(pixCoord.xy)] = PackToR11G10B10A1f(RadianceInterpolated, WeightSumm > 0.01);
+}

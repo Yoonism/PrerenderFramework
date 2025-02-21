@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 29ad4c01a2e822c4d969e07c791cc6d1
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 2100000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Sample Scene (Cornell Box)/Terrain/Trees/Tree Trank.mat
+  uploadId: 728261

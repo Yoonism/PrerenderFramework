@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: e9cdaf04185e15745baaf35db61a9326
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Transparent/MK_Transparent-DiffuseBumpSpec.shader
+  uploadId: 705540

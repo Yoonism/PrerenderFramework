@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: 34a47d205ffc45e47949b1581df454f1
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/MKGlowStandard.shader
+  uploadId: 705540

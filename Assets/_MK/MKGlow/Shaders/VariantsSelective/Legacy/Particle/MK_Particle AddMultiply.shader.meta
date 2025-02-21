@@ -1,0 +1,17 @@
+fileFormatVersion: 2
+guid: c64330115a26f1444989ec98fa892cd9
+timeCreated: 1511736203
+licenseType: Store
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Particle/MK_Particle
+    AddMultiply.shader
+  uploadId: 705540

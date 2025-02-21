@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 1ab2be9990cb35c46814341b659e0258
+PrefabImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Sample Scene (Cornell Box)/Terrain/Trees/TreePrefab.prefab
+  uploadId: 728261

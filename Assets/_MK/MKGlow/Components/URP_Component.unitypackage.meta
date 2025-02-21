@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 3181139f989f14f4eba70d9c8fc56200
+DefaultImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Components/URP_Component.unitypackage
+  uploadId: 705540

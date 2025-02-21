@@ -1,0 +1,240 @@
+#pragma kernel TemporalDenoising
+#pragma kernel SpatialCleanup
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+
+
+H_TEXTURE(_Radiance);
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_Radiance_History);
+H_TEXTURE(_NormalDepth_History);
+H_RW_TEXTURE(float4, _Radiance_Output);
+
+groupshared uint RadianceLDS[16][16];
+
+
+void FillRadianceLDS(int2 pixCoord, int2 groupThreadID)
+{
+    pixCoord.xy -= 4;
+    
+    RadianceLDS[groupThreadID.x + 0][groupThreadID.y + 0] = asuint(H_LOAD(_Radiance, pixCoord.xy + int2(0, 0)).x);
+    RadianceLDS[groupThreadID.x + 8][groupThreadID.y + 0] = asuint(H_LOAD(_Radiance, pixCoord.xy + int2(8, 0)).x);
+    RadianceLDS[groupThreadID.x + 0][groupThreadID.y + 8] = asuint(H_LOAD(_Radiance, pixCoord.xy + int2(0, 8)).x);
+    RadianceLDS[groupThreadID.x + 8][groupThreadID.y + 8] = asuint(H_LOAD(_Radiance, pixCoord.xy + int2(8, 8)).x);
+}
+
+float DisocclusionDetection(CurrentFrameData CurrentData, PrevFrameData PrevData)
+{
+    float PlaneDistance = abs(dot(PrevData.WorldPos - CurrentData.WorldPos, CurrentData.Normal));
+    float RelativeDepthDifference = PlaneDistance / CurrentData.DepthLinear;
+    if (exp2(-100000 * (RelativeDepthDifference * RelativeDepthDifference )) < 0.1f)
+        return 0;
+    
+    float DepthThreshold = lerp(1e-2f, 1e-1f, CurrentData.AligmentZ);
+    if (abs((PrevData.DepthLinear - CurrentData.DepthLinear) / CurrentData.DepthLinear) >= DepthThreshold)
+        return 0;
+
+    if (USE_NORMAL_REJECTION)
+    {
+        float NormalThreshold = lerp(1, CurrentData.AligmentZ, saturate(length(CurrentData.WorldPos) / 5));
+        if (dot(PrevData.Normal, CurrentData.Normal) < lerp(0.0, 0.95, NormalThreshold))
+            return 0;  
+    }
+    
+    return 1;
+}
+
+
+
+// ------------------------ TEMPORAL DENOISING KERNEL ------------------------
+[numthreads(8, 8, 1)]
+void TemporalDenoising(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Transfer data to LDS
+    FillRadianceLDS(pixCoord.xy, groupThreadID);
+    GroupMemoryBarrierWithGroupSync();
+    groupThreadID += 4;
+
+    // Fetch current center radiance from LDS
+    bool IsValid;
+    float3 Radiance = UnpackFromR11G10B10A1f(RadianceLDS[groupThreadID.x][groupThreadID.y], IsValid);
+
+    // Calculate history coord
+    float2 CoordHistoryNDC = ((pixCoord.xy - HBUFFER_MOTION_VECTOR(pixCoord.xy) * _ScreenSize.xy) + 0.5f) / _ScreenSize.xy;
+
+    // If history coords are off screen - early out
+    if (any(CoordHistoryNDC < 0) || any(CoordHistoryNDC > 1))
+    {
+        _Radiance_Output[H_COORD(pixCoord.xy)] = float4(Radiance, 1);
+        return;
+    }
+
+    // Load current frame data
+    CurrentFrameData CurrentData;
+    CurrentData.DepthRaw = HBUFFER_DEPTH(pixCoord.xy);
+    CurrentData.Normal = H_LOAD(_GeometryNormal, pixCoord.xy).xyz;
+    CurrentData.WorldPos = ComputeWorldSpacePosition((pixCoord.xy + 0.5f) * _ScreenSize.zw, CurrentData.DepthRaw, UNITY_MATRIX_I_VP);
+    CurrentData.DepthLinear = LinearEyeDepth(CurrentData.WorldPos, UNITY_MATRIX_V);
+    CurrentData.AligmentZ = 1.0f - dot(-normalize(GetAbsolutePositionWS((CurrentData.WorldPos)) - _WorldSpaceCameraPos), CurrentData.Normal);
+
+    // Early-out on the skybox
+    if (CurrentData.DepthRaw <= 1e-7)
+    {
+        _Radiance_Output[H_COORD(pixCoord.xy)] = 0;
+        return;
+    }
+    
+    // Calculate manual bilinear sample offsets and weights
+    float UVx = frac(float(_ScreenSize.x) * CoordHistoryNDC.x + 0.5);
+    float UVy = frac(float(_ScreenSize.y) * CoordHistoryNDC.y + 0.5);
+    int2 ReprojectionCoord = int2(_ScreenSize.xy * CoordHistoryNDC - 0.5);
+
+    float4 ReprojectionWeights;
+    ReprojectionWeights.x = (1.0f - UVx) * (1.0f - UVy);
+    ReprojectionWeights.y = (UVx) * (1.0f - UVy);
+    ReprojectionWeights.z = (1.0f - UVx) * (UVy);
+    ReprojectionWeights.w = (UVx) * (UVy);
+    
+    uint2 ReprojectionOffsets[4] = {uint2(0, 0), uint2(1, 0), uint2(0, 1), uint2(1, 1)};
+    
+    UNITY_UNROLL // Go through all bilinear samples and check disocclusion for each sample
+    for (int i = 0; i < 4; i++)
+    {
+        int2 SampleCoord = ReprojectionCoord + ReprojectionOffsets[i];
+        float4 NormalDepthHistory = UnpackNormalDepthFull(asuint(H_LOAD(_NormalDepth_History, SampleCoord).xy));
+        
+        PrevFrameData PrevData;
+        PrevData.WorldPos = ComputeWorldSpacePosition((SampleCoord + 0.5f) / _ScreenSize.xy, NormalDepthHistory.w, UNITY_MATRIX_PREV_I_VP);
+        PrevData.DepthLinear = LinearEyeDepth(PrevData.WorldPos, UNITY_MATRIX_V);
+        PrevData.Normal = NormalDepthHistory.xyz;
+        
+        ReprojectionWeights[i] *= DisocclusionDetection(CurrentData, PrevData);
+    }
+
+    // Normalize reprojection weights
+    float WeightsSumm = max(ReprojectionWeights.x + ReprojectionWeights.y + ReprojectionWeights.z + ReprojectionWeights.w, 1.0e-3);
+    ReprojectionWeights /= WeightsSumm;
+
+    // Load 4 bilinear samples of our history
+    float4 RadianceHistory = 0;
+    RadianceHistory += H_LOAD(_Radiance_History, ReprojectionCoord + uint2(0, 0)) * ReprojectionWeights.x;
+    RadianceHistory += H_LOAD(_Radiance_History, ReprojectionCoord + uint2(1, 0)) * ReprojectionWeights.y;
+    RadianceHistory += H_LOAD(_Radiance_History, ReprojectionCoord + uint2(0, 1)) * ReprojectionWeights.z;
+    RadianceHistory += H_LOAD(_Radiance_History, ReprojectionCoord + uint2(1, 1)) * ReprojectionWeights.w;
+
+    // SampleCount is stored in the alpha channel
+    float SampleCount = RadianceHistory.w;
+    
+    float3 Moment1;
+    float3 Moment2;
+    float GatheredWeight = 0;
+
+    // Gather local statistics
+    for (int x = -3; x <= 3; x++)
+    {
+        for (int y = -3; y <= 3; y++)
+        {
+            float3 RadianceSample = UnpackFromR11G10B10A1f(RadianceLDS[groupThreadID.x + x][groupThreadID.y + y]);
+  
+            float Weight = exp(-3.0 * float(x * x + y * y) / float((3 + 1) * (3 + 1)));
+            
+            Moment1 += RadianceSample * Weight;
+            Moment2 += RadianceSample * RadianceSample * Weight;
+
+            GatheredWeight += Weight;
+        }
+    }
+ 
+    Moment1 /= GatheredWeight;
+    Moment2 /= GatheredWeight;
+    
+    float3 StdDev = sqrt(abs(Moment2 - Moment1 * Moment1));
+    
+    // Calculates AABB box extents
+    float3 ClampMin = Radiance - StdDev * AABB_CLIP_EXTENT;
+    float3 ClampMax = Radiance + StdDev * AABB_CLIP_EXTENT;
+
+    // Backup unclamped history
+    float3 RadianceHistoryUnclamped = RadianceHistory.xyz;
+
+
+    // Clamp history to AABB box
+    RadianceHistory.xyz = DirectClipToAABB(RadianceHistory.xyz, ClampMin, ClampMax);
+
+    float lum0 = Luminance(Radiance.rgb);
+    float lum1 = Luminance(RadianceHistory.rgb);
+    
+    float unbiased_diff = abs(lum0 - lum1) / max(lum0, max(lum1, 0.2));
+    float unbiased_weight = 1.0 - unbiased_diff;
+    float unbiased_weight_sqr = unbiased_weight * unbiased_weight;
+    float MaxSampleCount = lerp(MAX_SAMPLECOUNT / 2, MAX_SAMPLECOUNT, unbiased_weight_sqr);
+    
+    SampleCount = min(MaxSampleCount, SampleCount + 1);
+
+    float TemporalWeight = 1.0f - (1.0f / float(SampleCount));
+    
+    // If current radiance is invalid (interpolation has failed) then we replace it with the history radiance if possible
+    if (!IsValid && any(ReprojectionWeights > 0.1))
+    {
+        // Trade off between reconstruction accuracy and lighting response speed
+        float MaxLumaDifference = 2;
+        RadianceHistoryUnclamped *= clamp(Luminance(RadianceHistory.xyz) / max(1e-8, Luminance(RadianceHistoryUnclamped)) * MaxLumaDifference, 0.01, 1.0);
+
+        // We must use unclamped history radiance as our replacement.
+        RadianceHistory.xyz = RadianceHistoryUnclamped;
+        SampleCount = MAX_SAMPLECOUNT;
+        TemporalWeight = 0.99f;
+    }
+
+    if (DISABLE_TEMPORAL_DENOISER)
+        TemporalWeight = 0;
+    
+    if (TEMPORAL_DENOISER_EXPOSURE_CONTROL)
+    {
+        // Grab the previous frame and current frame exposures
+        float ExposurePrevious = GetPreviousExposureMultiplier();
+        float ExposureCurrent = GetCurrentExposureMultiplier();
+    
+        // Compute the exposure ratio (while avoiding zeros)
+        float ExposureRatio = (ExposurePrevious * ExposureCurrent) != 0.0 ? ExposureCurrent / ExposurePrevious : 100.0;
+    
+        // Evaluate if the exposure multiplier was at least twice bigger or smaller
+        bool IsExposureValid = max(ExposureRatio, 1.0 / ExposureRatio) < 2.0;
+    
+        // If the exposure change was considered valid, we can keep the result and re-exposed it. Otherwise, we cannot use the history buffer
+        if (IsExposureValid)
+        {
+            RadianceHistory.xyz = RadianceHistory.xyz * GetInversePreviousExposureMultiplier() * ExposureCurrent;
+        }
+        else
+        {
+            TemporalWeight = 0;   
+        }
+    }
+ 
+    // Blend with history
+    Radiance = lerp(Radiance, RadianceHistory.xyz, TemporalWeight) ; //TemporalWeight);
+    
+    // Output radiance & samplecount
+    _Radiance_Output[H_COORD(pixCoord.xy)] = float4(Radiance, SampleCount);
+}
+
+
+H_RW_TEXTURE(uint2, _NormalDepth_HistoryOutput);
+H_RW_TEXTURE(float4, _Radiance_HistoryOutput);
+
+[numthreads(8, 8, 1)]
+void SpatialCleanup(uint3 pixCoord : SV_DispatchThreadID, int2 groupThreadID : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    float Depth = HBUFFER_DEPTH(pixCoord.xy);
+    float3 Normal = float4(H_LOAD(_GeometryNormal, pixCoord.xy)).xyz;
+    _NormalDepth_HistoryOutput[H_COORD(pixCoord.xy)] = PackNormalDepth(Normal, Depth);
+    
+    float4 Radiance = H_LOAD(_Radiance, pixCoord.xy);
+    _Radiance_HistoryOutput[H_COORD(pixCoord.xy)] = Radiance;
+}

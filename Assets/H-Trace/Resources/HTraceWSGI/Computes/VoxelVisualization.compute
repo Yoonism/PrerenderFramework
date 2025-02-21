@@ -1,0 +1,90 @@
+#pragma kernel VisualizeVoxels
+
+#pragma multi_compile_local _ VISUALIZE_LIGHTING
+#pragma multi_compile PROBE_VOLUMES_OFF PROBE_VOLUMES_L1 PROBE_VOLUMES_L2
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+#include "../Includes/SpatialHash.hlsl"
+#include "../Includes/VoxelLightingEvaluation.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Material.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/BuiltinGIUtilities.hlsl"
+#include "Packages/com.unity.render-pipelines.core/Runtime/Lighting/ProbeVolume/ProbeVolume.hlsl"
+
+// Input Buffers
+H_TEXTURE(_DebugRayDirection);
+
+// Output Buffers
+H_RW_TEXTURE(float3, _Visualization_Output);
+
+int _MultibounceMode;
+
+[numthreads(8, 8, 1)]
+void VisualizeVoxels(uint3 pixCoord : SV_DispatchThreadID)
+{
+	UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+	
+	// We have deleted "_RTHandleScale" here because when switching from Game to Scene view we got a strecthed and distorted debug image.
+    float3 RayDirection = H_SAMPLE_LOD(_DebugRayDirection, H_SAMPLER_LINEAR_CLAMP, (pixCoord.xy + 0.5) * _ScreenSize.zw, 0).xyz;
+    float3 RayOrigin = GetAbsolutePositionWS(0);
+//	ApplyCameraRelativeXR(RayOrigin); 
+	
+    // Initialize voxel ray payload
+    VoxelPayload Payload;
+    InitializePayload(Payload);
+   
+    float Depth = HBUFFER_DEPTH(pixCoord.xy);
+    float DepthLinear = Linear01Depth(Depth, _ZBufferParams);
+    DepthLinear *= length(RayDirection);
+	
+    DepthLinear = Depth <= UNITY_RAW_FAR_CLIP_VALUE ? _VoxelBounds.x : DepthLinear;
+    RayDirection = normalize(RayDirection);
+   
+    // Trace into voxels
+    bool HitFound = TraceVoxelsDiffuse(RayOrigin, RayDirection, MaxVoxelRayDistance(RayOrigin, RayDirection), 1000, Payload);
+
+	if (HitFound)
+	{
+		EvaluateHitLighting(Payload);
+		
+		if (VISUALIZE_LIGHTING)
+		{
+			if (_MultibounceMode == 1)
+			{
+				uint HashIndex = HashGetIndex(ComputeRadianceCacheCoord(Payload.HitCoord), PackVoxelNormalIndex(Payload.HitNormal));
+			
+				uint HashIndexFound;
+				uint HashKey = PackHashKey(ComputeRadianceCacheCoord(Payload.HitCoord), Payload.HitNormal);
+				bool HashFound = HashFindValid(HashIndex, HashKey, HashIndexFound);
+			
+				if (HashFound)
+				{
+					float3 RadianceCache = UnpackCacheRadianceFull(_HashBuffer_Radiance[HashIndexFound].xyz); 
+					Payload.HitCache = RadianceCache * GetCurrentExposureMultiplier();
+				}
+			}
+			else if (_MultibounceMode == 2)
+			{
+				if (_EnableProbeVolumes)
+				{
+					if (APV_FALLBACK && (PROBE_VOLUMES_L1 || PROBE_VOLUMES_L2))
+					{
+						float3 Unused = 0;
+						EvaluateAdaptiveProbeVolume(Payload.HitPosition, Payload.HitNormal, 0.0, 0.0, 100, Payload.HitCache, Unused);
+						Payload.HitCache *= GetCurrentExposureMultiplier();
+					}
+				}
+			}
+
+			_Visualization_Output[H_COORD(pixCoord.xy)] = Payload.HitColor * GetCurrentExposureMultiplier() + Payload.HitCache * Payload.HitDiffuse;
+		}
+		else
+		{
+			_Visualization_Output[H_COORD(pixCoord.xy)] = Payload.HitDiffuse;
+		}
+	}
+	else
+	{
+		_Visualization_Output[H_COORD(pixCoord.xy)] = SAMPLE_TEXTURECUBE_ARRAY_LOD(_SkyTexture, H_SAMPLER_TRILINEAR_CLAMP, RayDirection, 0, 0).xyz * GetCurrentExposureMultiplier();
+	}
+}

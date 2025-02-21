@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 5608f712375ccb145a26c2731a92cece
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Scripts/PipelinesConfigurator/HMenuAndFilesManager.cs
+  uploadId: 728261

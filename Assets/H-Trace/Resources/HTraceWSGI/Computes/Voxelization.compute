@@ -1,0 +1,157 @@
+﻿#pragma kernel GeneratePositionPyramid1
+#pragma kernel GeneratePositionPyramid2
+#pragma kernel CopyData
+
+#pragma warning (disable : 3206)
+
+#include "../Includes/VoxelTraversal.hlsl"
+
+H_TEXTURE3D(uint, _VoxelPositionIntermediate);
+
+H_RW_TEXTURE3D(uint, _VoxelData_A);
+H_RW_TEXTURE3D(uint, _VoxelData_B);
+H_RW_TEXTURE3D(uint, _VoxelPositionPyramid_MIP0);
+H_RW_TEXTURE3D(uint, _VoxelPositionPyramid_MIP1);
+H_RW_TEXTURE3D(uint, _VoxelPositionPyramid_MIP2);
+H_RW_TEXTURE3D(uint, _VoxelPositionPyramid_MIP3);
+H_RW_TEXTURE3D(uint, _VoxelPositionPyramid_MIP4);
+H_RW_TEXTURE3D(uint, _VoxelPositionPyramid_MIP5);
+H_RW_TEXTURE3D(uint, _VoxelPositionIntermediate_Output);
+
+float3 _VoxelOffset;
+float3 _OctantCopyOffset;
+
+groupshared bool PositionLDS[4][4][4];
+
+// ------------------------ SCROLLING DATA COPY -------------------------
+[numthreads(4,4,4)]
+void CopyData(uint3 pixCoord : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	pixCoord.xyz *= uint3(2,2,2);
+	
+	int3 CopyCoord = pixCoord.xyz + _OctantCopyOffset.xyz;
+	int3 CameraDelta = round((_VoxelOffset) * _VoxelPerMeter);
+
+	int3 TapOffsets[8] = {int3(0,0,0), int3(0,0,1), int3(0,1,0), int3(1,0,0), int3(0,1,1), int3(1,0,1), int3(1,1,0), int3(1,1,1)};
+
+	for (int i = 0; i < 8; i++)
+	{
+		int3 TapCoord = CopyCoord + TapOffsets[i];
+
+		uint VoxelDataB = _VoxelData_B[TapCoord + CameraDelta];
+		bool IsDynamic = (VoxelDataB >> 23) & 0x1; // Dynamic bit flat (0 - dynamic, 1 - static)
+
+		if (VoxelDataB * IsDynamic != 0u)
+		_VoxelData_A[TapCoord] = VoxelDataB; // Copy and clear dynamic voxels
+	}
+}
+
+// ------------------------ MIP LEVEL 0-2 GENERATION -------------------------
+[numthreads(4,4,4)]
+void GeneratePositionPyramid1(uint3 pixCoord : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	pixCoord.xyz *= uint3(2,2,2);
+	
+	int3 TapOffsets[8] = {int3(0,0,0), int3(0,0,1), int3(0,1,0), int3(1,0,0), int3(0,1,1), int3(1,0,1), int3(1,1,0), int3(1,1,1)};
+
+	uint VoxelPositionMIP1 = 0;
+	for (int i = 0; i < 8; i++)
+	{
+		int3 TapCoord = pixCoord.xyz + TapOffsets[i];
+		uint VoxelPosition = asuint(H_LOAD3D(_VoxelData, TapCoord)) & 0xFF000000;
+		VoxelPosition = VoxelPosition >> 24;
+		
+		if (VoxelPosition != 0u)
+		_VoxelPositionPyramid_MIP0[TapCoord] = VoxelPosition;
+
+		VoxelPosition = VoxelPosition > 0 ? 1 : 0;
+		VoxelPositionMIP1 += VoxelPosition;
+	}
+	
+	// Kills voxels that are less than half filled (4 out of 8 bricks) by rounding ? 
+	// VoxelPosition_MIP1 /= 8.0f;
+
+	PositionLDS[groupThreadID.x][groupThreadID.y][groupThreadID.z] = VoxelPositionMIP1;
+	GroupMemoryBarrierWithGroupSync();
+
+	if (VoxelPositionMIP1 > 0)
+		_VoxelPositionPyramid_MIP1[pixCoord / int3(2, 2, 2)] = VoxelPositionMIP1;
+
+	[branch]
+	if (all((groupThreadID.xyz % int3(2, 2, 2)) == 0))
+	{
+		uint VoxelPositionMIP2 = 0;
+		for (int i = 0; i < 8; i++)
+		{
+			int3 TapCoord = groupThreadID.xyz + TapOffsets[i];
+
+			uint VoxelPosition = PositionLDS[TapCoord.x][TapCoord.y][TapCoord.z];
+			VoxelPositionMIP2 += VoxelPosition;
+		}
+		
+		if (VoxelPositionMIP2 > 0)
+		{
+			_VoxelPositionPyramid_MIP2[pixCoord / int3(4, 4, 4)] = VoxelPositionMIP2;
+			_VoxelPositionIntermediate_Output[pixCoord / int3(4, 4, 4)] = VoxelPositionMIP2;
+		}
+	}
+}
+
+// ------------------------ MIP LEVEL 3-5 GENERATION -------------------------
+[numthreads(4,4,4)]
+void GeneratePositionPyramid2(uint3 pixCoord : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID)
+{
+	pixCoord.xyz *= uint3(2,2,2);
+	
+	int3 TapOffsets[8] = {int3(0,0,0), int3(0,0,1), int3(0,1,0), int3(1,0,0), int3(0,1,1), int3(1,0,1), int3(1,1,0), int3(1,1,1)};
+	
+	uint VoxelPositionMIP3 = 0;
+	for (int i = 0; i < 8; i++)
+	{
+		int3 TapCoord = pixCoord.xyz + TapOffsets[i];
+		uint VoxelPosition = H_LOAD3D(_VoxelPositionIntermediate, TapCoord); // & 0x000000FF;
+
+		if (VoxelPosition > 0)
+		_VoxelPositionPyramid_MIP3[pixCoord / int3(2, 2, 2)] = VoxelPosition;
+
+		VoxelPositionMIP3 += VoxelPosition;
+	}
+
+	if (VoxelPositionMIP3 > 0)
+	_VoxelPositionPyramid_MIP3[pixCoord / int3(2, 2, 2)] = VoxelPositionMIP3;
+	
+	PositionLDS[groupThreadID.x][groupThreadID.y][groupThreadID.z] = VoxelPositionMIP3;
+	GroupMemoryBarrierWithGroupSync();
+
+	[branch]
+	if (all((groupThreadID.xyz % int3(2, 2, 2)) == 0))
+	{
+		uint VoxelPositionMIP4 = 0;
+		for (int i = 0; i < 8; i++)
+		{
+			int3 TapCoord = groupThreadID.xyz + TapOffsets[i];
+			VoxelPositionMIP4 += PositionLDS[TapCoord.x][TapCoord.y][TapCoord.z];
+		}
+
+		if (VoxelPositionMIP4 > 0)
+		_VoxelPositionPyramid_MIP4[pixCoord / int3(4, 4, 4)] = VoxelPositionMIP4;
+		
+		PositionLDS[groupThreadID.x / 2][groupThreadID.y / 2][groupThreadID.z / 2] = VoxelPositionMIP4;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	[branch]
+	if (all((groupThreadID.xyz % int3(4, 4, 4)) == 0))
+	{
+		uint VoxelPositionMIP5 = 0;
+		for (int i = 0; i < 8; i++)
+		{
+			int3 TapCoord = groupThreadID.xyz + TapOffsets[i];
+			VoxelPositionMIP5 += PositionLDS[TapCoord.x][TapCoord.y][TapCoord.z];
+		}
+
+		if (VoxelPositionMIP5 > 0)
+		_VoxelPositionPyramid_MIP5[pixCoord / int3(8, 8, 8)] = VoxelPositionMIP5;
+	}
+}

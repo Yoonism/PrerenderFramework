@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 203803c1bb3b89a4c8f6d360060fe77d
+ComputeShaderImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Computes/VoxelVisualization.compute
+  uploadId: 728261

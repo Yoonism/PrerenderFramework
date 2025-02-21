@@ -1,0 +1,425 @@
+#pragma kernel ProbeAtlasTemporalReuse
+#pragma kernel ProbeAtlasSpatialReuse
+#pragma kernel ProbeAtlasSpatialReuseDisocclusion
+#pragma kernel ReservoirHistoryUpdate
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+#include "../Includes/Reservoir.hlsl"
+
+H_TEXTURE(_ShadowGuidanceMask);
+H_TEXTURE(_ReprojectionCoords);
+H_TEXTURE(_DepthPyramid);
+
+H_TEXTURE(_SampleCount);
+H_TEXTURE(_RayDistance);
+H_TEXTURE(_RayDirection);
+H_TEXTURE(_RadianceAtlas);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_ReprojectionWeights);
+H_TEXTURE(_PersistentReprojectionCoord);
+
+H_TEXTURE_ARRAY(_SpatialWeightsPacked);
+H_TEXTURE_ARRAY(_SpatialOffsetsPacked);
+
+H_RW_TEXTURE(float, _ShadowGuidanceMaskTest_Output);
+
+RWStructuredBuffer<uint2> _TracingCoords;
+RWStructuredBuffer<uint> _RayCounter;
+
+int _IndexXR;
+int _PassNumber;
+int _DisocclusionPass;
+
+
+// ------------------------ PROBE ATLAS TEMPORAL REUSE ------------------------
+[numthreads(8, 8, 1)]
+void ProbeAtlasTemporalReuse(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Calculate probe coords
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+  
+    // Load and clip center radiance
+    bool Unused;
+    float3 Radiance = H_LOAD(_RadianceAtlas, pixCoord.xy).xyz; // UnpackFromR11G10B10A1f(asuint(H_LOAD(_RadianceAtlas, pixCoord.xy)), Unused);
+    Radiance *= GetCurrentExposureMultiplier(); 
+    Radiance = HClipRadiance(Radiance, 10.0f);
+
+    // Load reprojection coords and weights and normalize them
+    uint ReprojectionIndex;
+    float4 ReprojectionWeights = H_LOAD(_ReprojectionWeights, ProbeCoord);
+    int2 ReprojectionCoordPacked = asuint(H_LOAD(_PersistentReprojectionCoord, ProbeCoord).xy);
+    int2 ReprojectionCoord = UnpackPersistentReprojectionCoord(ReprojectionCoordPacked, ReprojectionIndex);
+    
+    // Normalize reprojection weights
+    float WeightsSumm = max(ReprojectionWeights.x + ReprojectionWeights.y + ReprojectionWeights.z + ReprojectionWeights.w, 1.0e-3);
+    ReprojectionWeights /= WeightsSumm;
+    
+    uint2 ProbeOffset;
+    float3 RayOriginNormal = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, ProbeCoord).xy), ProbeOffset).xyz;
+
+    // Prepare diffuse and random values for reservoir exchange
+    float3 Diffuse = GetReservoirDiffuse(ProbeCoord);
+    uint ReservoirUpdateRandom = Hash3(uint3(pixCoord.xy, _FrameCount));
+    
+    // Initialize and fill main reservoir
+    Reservoir Reservoir;
+    ReservoirInitialize(pixCoord.xy, Reservoir);
+
+    Reservoir.Radiance.Color = Radiance;
+    Reservoir.Radiance.Wsum = Luminance(Radiance * Diffuse);
+    Reservoir.Radiance.W = 0;
+    Reservoir.Radiance.M = 1;
+
+    Reservoir.Ray.OriginNormal = RayOriginNormal;
+    Reservoir.Ray.Direction = H_LOAD(_RayDirection, pixCoord.xy).xyz * 2 - 1;
+    Reservoir.Ray.Distance = H_LOAD(_RayDistance, pixCoord.xy).x;
+        
+    float ReservoirHistoryClamp = RESTIR_MAX_HISTORY;
+    ReservoirHistoryClamp = (ReservoirHistoryClamp / float(ReprojectionIndex + 1));
+    
+    // Checkerboard handling:
+    // 1. If ray distance > 0 - this cell is not culled by checkerboarding (we have a minimum dist 0.001 for active cells)
+    // 2. If the reproj. index > 0 - this cell is also not culled by checkerboarding (we trace new rays if we couldn't reproject from N-1 frame)
+    if (Reservoir.Ray.Distance <= 0 && ReprojectionIndex == 0)
+    {
+        Reservoir.Radiance.M = 0; // Kills reservoir weight, allowing history reservoirs take precedence
+        ReservoirHistoryClamp /= 2;
+    }
+    
+    // Calculate cell coordinates
+    int2 CellTapCoord00 = ReprojectionCoord * _OctahedralSize + uint2(0, 0) * _OctahedralSize + CellCoord;
+    int2 CellTapCoord01 = ReprojectionCoord * _OctahedralSize + uint2(1, 0) * _OctahedralSize + CellCoord;
+    int2 CellTapCoord10 = ReprojectionCoord * _OctahedralSize + uint2(0, 1) * _OctahedralSize + CellCoord;
+    int2 CellTapCoord11 = ReprojectionCoord * _OctahedralSize + uint2(1, 1) * _OctahedralSize + CellCoord;
+    
+    // Load packed history reservoir samples
+    uint4 ReservoirHistoryPacked00 = asuint(H_LOAD_ARRAY(_ReservoirAtlas_History, CellTapCoord00, GetHistoryIndex(ReprojectionIndex)));
+    uint4 ReservoirHistoryPacked01 = asuint(H_LOAD_ARRAY(_ReservoirAtlas_History, CellTapCoord01, GetHistoryIndex(ReprojectionIndex)));
+    uint4 ReservoirHistoryPacked10 = asuint(H_LOAD_ARRAY(_ReservoirAtlas_History, CellTapCoord10, GetHistoryIndex(ReprojectionIndex)));
+    uint4 ReservoirHistoryPacked11 = asuint(H_LOAD_ARRAY(_ReservoirAtlas_History, CellTapCoord11, GetHistoryIndex(ReprojectionIndex)));
+    
+    float4 NormalWeights;
+    NormalWeights.x = saturate(dot(UnpackDirection24bit(ReservoirHistoryPacked00.w), RayOriginNormal));
+    NormalWeights.y = saturate(dot(UnpackDirection24bit(ReservoirHistoryPacked01.w), RayOriginNormal));
+    NormalWeights.z = saturate(dot(UnpackDirection24bit(ReservoirHistoryPacked10.w), RayOriginNormal));
+    NormalWeights.w = saturate(dot(UnpackDirection24bit(ReservoirHistoryPacked11.w), RayOriginNormal));
+
+    // Continious disocclusion check based on the normal stored in the resevoir, helps with reducing reprojection artifacts over time
+    if (any(NormalWeights * ReprojectionWeights > 0.25))
+        ReprojectionWeights *= NormalWeights;
+
+    
+    // Merge with center reservoir
+    uint4 Merged = 0;
+    if (!DISABLE_RESTIR_TEMPORAL)
+    {
+        Merged.x = ReservoirMergeTemporal(CellTapCoord00, ReservoirHistoryPacked00, GetHistoryIndex(ReprojectionIndex), ReprojectionWeights.x, Diffuse, ReservoirUpdateRandom, Reservoir);
+        Merged.y = ReservoirMergeTemporal(CellTapCoord01, ReservoirHistoryPacked01, GetHistoryIndex(ReprojectionIndex), ReprojectionWeights.y, Diffuse, ReservoirUpdateRandom, Reservoir);
+        Merged.z = ReservoirMergeTemporal(CellTapCoord10, ReservoirHistoryPacked10, GetHistoryIndex(ReprojectionIndex), ReprojectionWeights.z, Diffuse, ReservoirUpdateRandom, Reservoir);
+        Merged.w = ReservoirMergeTemporal(CellTapCoord11, ReservoirHistoryPacked11, GetHistoryIndex(ReprojectionIndex), ReprojectionWeights.w, Diffuse, ReservoirUpdateRandom, Reservoir);
+    }
+ 
+    float3 ResDirection = Reservoir.Ray.Direction; 
+    float ResDistance =  Reservoir.Ray.Distance;
+    
+    // Load probe normal, depth & offset
+    float4 RayOriginNormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, ProbeCoord).xy), ProbeOffset);
+    float2 ProbeCoordNDC = (ProbeCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw;
+    
+    float3 PositionWS = ComputeWorldSpacePosition(ProbeCoordNDC.xy, RayOriginNormalDepth.w, UNITY_MATRIX_I_VP);
+    
+    float3 PositionOriginal = PositionWS;
+    
+    // PositionWS += 0.01 * RayOriginNormalDepth.xyz;
+    // PositionWS += 0.01 * ResDirection;
+
+    // float3 NormalForBias = GeometryNormalWS;
+    float3 NormalForBias = dot(RayOriginNormalDepth.xyz, Reservoir.Ray.Direction) < 0 ? -RayOriginNormalDepth.xyz : RayOriginNormalDepth.xyz;
+
+    // Calculate normal bias
+    float2 CornerCoordNDC = ProbeCoordNDC + 0.5f * _ScreenSize.zw * float(_OctahedralSize);
+    float3 CornerPositionWS = ComputeWorldSpacePosition(CornerCoordNDC.xy, RayOriginNormalDepth.w, UNITY_MATRIX_I_VP);
+    float NormalBias = abs(dot(CornerPositionWS - PositionWS, NormalForBias)) * 2.0f;
+
+    // This can push the ray origin off-screen causing black pixels on the border
+    PositionWS += NormalForBias * NormalBias;
+    PositionWS += 0.01 * ResDirection;
+
+    float Dist = 0;
+    
+    bool IsHit = false;
+    float3 PosPrev = PositionWS;
+    for (int i = 0; i < 40; i++)
+    {
+        // if (length(PositionWS - PositionOriginal) >= ResDistance)
+        //     break;
+        
+        // Move along the ray with fixed steps
+        float3 PositionLocalWS = PositionWS + ResDirection * 0.01 * float(i);
+        float3 PositionNDC = ComputeNormalizedDeviceCoordinatesWithZ(PositionLocalWS, UNITY_MATRIX_VP).xyz;
+        
+        if (all(PositionNDC.xy > 0) && all(PositionNDC.xy < 1))
+        {
+            // Sample depth along the ray
+            float Depth = HBUFFER_DEPTH(PositionNDC.xy * _ScreenSize.xy); //(_DepthPyramid, PositionNDC.xy * _ScreenSize.xy);
+            Depth = H_LOAD(_DepthPyramid, PositionNDC.xy * _ScreenSize.xy).x;
+            
+            float DepthLinear = LinearEyeDepth(Depth, _ZBufferParams);
+            float PositionLinear = LinearEyeDepth(PositionNDC.z, _ZBufferParams);
+
+            if (Depth <= 1e-7)
+                break;
+            
+            // Decrement thickness counter each time the ray is above surface
+            if (DepthLinear < PositionLinear)
+            {
+                if ( abs(PositionLinear - DepthLinear) < 0.035)
+                {
+                    Dist = length(PositionOriginal - PositionLocalWS);
+                    IsHit = true;
+                }
+
+                
+                break;
+            }
+
+            PosPrev = PositionLocalWS;
+             
+        }
+        else
+        {
+            break;
+        }
+    }
+    
+    float HitDistanceWS = ResDistance;
+
+    float DebugOutput = 1;
+    
+    if (IsHit)
+        HitDistanceWS = length(PositionOriginal - PositionWS);
+
+    float Test = 1;
+    // If the distance difference is relatively high
+    if (abs(Dist - ResDistance) / (ResDistance + ResDistance) > 0.35)
+    {
+        if (IsHit && Dist <= ResDistance  )
+        {
+           // Reservoir.Radiance.Color = float3(1,0,0);
+             // Test = 0;
+             // ReservoirHistoryClamp = 0;
+        }
+    }
+    
+    // Clamp reservoir history
+    if (Reservoir.Radiance.M > ReservoirHistoryClamp)
+    {
+        Reservoir.Radiance.Wsum *= ReservoirHistoryClamp / Reservoir.Radiance.M;
+        Reservoir.Radiance.M = ReservoirHistoryClamp; 
+    }
+    
+    // Recalculate W 
+    Reservoir.Radiance.W = Reservoir.Radiance.Wsum / max(Reservoir.Radiance.M * Luminance(Reservoir.Radiance.Color * Diffuse), 1e-7) ;
+
+    // Apply exposure control
+    if (RESTIR_EXPOSURE_CONTROL)
+    {
+        float ExposurePrevious = GetPreviousExposureMultiplier();
+        float ExposureCurrent = GetCurrentExposureMultiplier();
+        
+        float ExposureRatio = (ExposurePrevious * ExposureCurrent) != 0.0 ? ExposureCurrent / ExposurePrevious : 100.0;
+        
+        if (max(ExposureRatio, 1.0 / ExposureRatio) < 2.0)
+            Reservoir.Radiance.W = Reservoir.Radiance.W * GetInversePreviousExposureMultiplier() * ExposureCurrent;
+    }
+    
+    // Pack radiance and ray datas
+    uint2 RadianceDataPacked = PackRadianceData(Reservoir.Radiance);
+    uint2 RayDataPacked = PackRayData(Reservoir.Ray);
+    
+   // float ShadowGuidanceMask = H_LOAD(_ShadowGuidanceMask, pixCoord.xy);
+
+    // Output reservoir atlas for history
+    _ReservoirAtlas_Output[H_COORD(pixCoord.xy)] = uint4(RadianceDataPacked.xy, RayDataPacked.xy);
+
+    // if (all(Merged == 0))
+    //     Test = 1; 
+    
+    RadianceDataPacked.x |= PackOcclusion(1, 1-Test);
+    
+    // Output radiance & ray datas for spatial reuse passes
+    _ReservoirAtlasRadianceData_Output[H_COORD(pixCoord.xy)] = RadianceDataPacked.xy;
+    _ReservoirAtlasRayData_Output[H_COORD(pixCoord.xy)] = RayDataPacked.x;
+}
+
+
+// ------------------------ PROBE ATLAS SPATIAL REUSE ------------------------
+[numthreads(8, 8, 1)]
+void ProbeAtlasSpatialReuse(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint2 groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z); 
+    
+    // Calculate probe and cell coord
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+
+    // Prepare diffuse and random values for reservoir exchange
+    float3 Diffuse = GetReservoirDiffuse(ProbeCoord);
+    uint ReservoirUpdateRandom = Hash3(uint3(pixCoord.xy, _FrameCount));
+
+    // Initialize reservoir
+    Reservoir Reservoir;
+    ReservoirInitialize(pixCoord.xy, Reservoir);
+
+    // Load and unpack radiance data to reservoir
+    uint2 RadianceDataPacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, pixCoord.xy).xy);
+    UnpackRadianceData(RadianceDataPacked, Diffuse, Reservoir.Radiance);
+
+    // Unpack occlusion (passed with packed radiance data)
+    bool IsDisocclusionCenter;
+    float ReservoirCenterOcclusion = UnpackOcclusion(RadianceDataPacked.x, IsDisocclusionCenter);
+    
+    // Load packed sample weights and coords
+    float SampleWeights[8]; int2 SampleOffsets[8];
+    uint4 PackedSampleOffsets = asuint(H_LOAD_ARRAY(_SpatialOffsetsPacked, ProbeCoord, _PassNumber));
+    uint4 PackedSampleWeights = asuint(H_LOAD_ARRAY(_SpatialWeightsPacked, ProbeCoord, _PassNumber));
+
+    // Unpack sample weights and coords
+    UnpackFilteringOffsetsX8(PackedSampleOffsets, SampleOffsets);
+    UnpackFilteringWeightsX8(PackedSampleWeights, SampleWeights);
+
+    for (int i = 0; i < 8; i++)
+    {
+        if (DISABLE_RESTIR_SPATIAL)
+            continue;
+        
+        // Calculate sample cell coord
+        uint2 CellTapCoord = ProbeCoord * _OctahedralSize + SampleOffsets[i] * _OctahedralSize + CellCoord;
+        
+        // Load packed sample reservoir and extract occlusion value from it
+        bool IsDisocclusionSample;
+        uint2 ReservoirSamplePacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, CellTapCoord).xy);
+        float ReservoirSampleOcclusion = UnpackOcclusion(ReservoirSamplePacked.x, IsDisocclusionSample);
+        
+        // Calculate shadow guidance cutoff
+        float ShadowGuidanceWeight = exp2(-min(Reservoir.Radiance.M, 20) * abs(ReservoirCenterOcclusion - ReservoirSampleOcclusion));
+        
+        // Merge with center reservoir
+        ReservoirMergeSpatial(CellTapCoord, ReservoirSamplePacked, SampleWeights[i] * ShadowGuidanceWeight, Diffuse, Reservoir, ReservoirUpdateRandom);
+    }
+    
+    // Recalculate W
+    Reservoir.Radiance.W = Reservoir.Radiance.Wsum / max(Reservoir.Radiance.M * Luminance(Reservoir.Radiance.Color * Diffuse), 1e-7) ;
+    
+    // Pack radiance data and occlusion back
+    RadianceDataPacked = PackRadianceData(Reservoir.Radiance);
+    RadianceDataPacked.x |= PackOcclusion(ReservoirCenterOcclusion, IsDisocclusionCenter);
+    
+    // Output main and data reservoirs
+    _ReservoirAtlasRadianceData_Output[H_COORD(pixCoord.xy)] = RadianceDataPacked;
+    _ReservoirAtlasRayData_Output[H_COORD(pixCoord.xy)] = asuint(H_LOAD(_ReservoirAtlasRayData, Reservoir.MergedCoord).x);
+}
+
+
+// ------------------------ PROBE ATLAS SPATIAL REUSE DISOCCLUSION------------------------
+[numthreads(8, 8, 1)]
+void ProbeAtlasSpatialReuseDisocclusion(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint2 groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint IndirectCoordOffsetVR =  _ScreenSize.x * _ScreenSize.y * _IndexXR;
+    uint RayCounterOffsetVR = 10 * _IndexXR;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[2 + 4 + RayCounterOffsetVR])
+        return;
+  
+    pixCoord.xy = _TracingCoords[RayIndex + IndirectCoordOffsetVR];
+    
+    // Calculate probe and cell coord
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+
+    // Prepare diffuse and random values for reservoir exchange
+    float3 Diffuse = GetReservoirDiffuse(ProbeCoord);
+    uint ReservoirUpdateRandom = Hash3(uint3(pixCoord.xy, _FrameCount));
+
+    // Initialize reservoir
+    Reservoir Reservoir;
+    ReservoirInitialize(pixCoord.xy, Reservoir);
+
+    // Load and unpack radiance data to reservoir
+    uint2 RadianceDataPacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, pixCoord.xy).xy);
+    UnpackRadianceData(RadianceDataPacked, Diffuse, Reservoir.Radiance);
+    
+    // Load packed sample weights and coords
+    float SampleWeights[8]; int2 SampleOffsets[8];
+    uint4 PackedSampleOffsets = asuint(H_LOAD_ARRAY(_SpatialOffsetsPacked, ProbeCoord, 1));
+    uint4 PackedSampleWeights = asuint(H_LOAD_ARRAY(_SpatialWeightsPacked, ProbeCoord, 1));
+
+    // Unpack sample weights and coords
+    UnpackFilteringOffsetsX8(PackedSampleOffsets, SampleOffsets);
+    UnpackFilteringWeightsX8(PackedSampleWeights, SampleWeights);
+    
+    for (int i = 0; i < 4; i++)
+    {
+        // Calculate sample cell coord
+        uint2 CellTapCoord = ProbeCoord * _OctahedralSize + SampleOffsets[i] * _OctahedralSize + CellCoord;
+        
+        uint2 ReservoirSamplePacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, CellTapCoord).xy);
+        
+        // Merge with center reservoir
+        ReservoirMergeSpatial(CellTapCoord, ReservoirSamplePacked, SampleWeights[i], Diffuse, Reservoir, ReservoirUpdateRandom);
+    }
+
+    PackedSampleOffsets = asuint(H_LOAD_ARRAY(_SpatialOffsetsPacked, ProbeCoord, 2));
+    PackedSampleWeights = asuint(H_LOAD_ARRAY(_SpatialWeightsPacked, ProbeCoord, 2));
+
+    // Unpack sample weights and coords
+    UnpackFilteringOffsetsX8(PackedSampleOffsets, SampleOffsets);
+    UnpackFilteringWeightsX8(PackedSampleWeights, SampleWeights);
+    
+    for (int t = 0; t < 4; t++)
+    {
+        // Calculate sample cell coord
+        uint2 CellTapCoord = ProbeCoord * _OctahedralSize + SampleOffsets[t] * _OctahedralSize + CellCoord;
+        
+        uint2 ReservoirSamplePacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, CellTapCoord).xy);
+        
+        // Merge with center reservoir
+        ReservoirMergeSpatial(CellTapCoord, ReservoirSamplePacked, SampleWeights[t], Diffuse, Reservoir, ReservoirUpdateRandom);
+    }
+
+    PackedSampleOffsets = asuint(H_LOAD_ARRAY(_SpatialOffsetsPacked, ProbeCoord, 3));
+    PackedSampleWeights = asuint(H_LOAD_ARRAY(_SpatialWeightsPacked, ProbeCoord, 3));
+
+    // Unpack sample weights and coords
+    UnpackFilteringOffsetsX8(PackedSampleOffsets, SampleOffsets);
+    UnpackFilteringWeightsX8(PackedSampleWeights, SampleWeights);
+    
+    for (int k = 0; k < 4; k++)
+    {
+        // Calculate sample cell coord
+        uint2 CellTapCoord = ProbeCoord * _OctahedralSize + SampleOffsets[k] * _OctahedralSize + CellCoord;
+        
+        uint2 ReservoirSamplePacked = asuint(H_LOAD(_ReservoirAtlasRadianceData, CellTapCoord).xy);
+        
+        // Merge with center reservoir
+        ReservoirMergeSpatial(CellTapCoord, ReservoirSamplePacked, SampleWeights[k], Diffuse, Reservoir, ReservoirUpdateRandom);
+    }
+
+    _ReservoirAtlasRayData_Output[H_COORD(pixCoord.xy)] = asuint(H_LOAD(_ReservoirAtlasRayData, Reservoir.MergedCoord).x);
+}
+
+
+// ------------------------ RESERVOIR HISTORY UPDATE ------------------------
+[numthreads(8, 8, 1)]
+void ReservoirHistoryUpdate(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _ReservoirAtlas_Output[uint3(pixCoord.xy, H_INDEX_ARRAY(uint(_FrameCount) % _PersistentHistorySamples))] = asuint(H_LOAD(_ReservoirAtlas, pixCoord.xy));
+}

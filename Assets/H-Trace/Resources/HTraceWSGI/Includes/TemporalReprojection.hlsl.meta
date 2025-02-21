@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 3a4ed4b8857066041be56bdf3b7a7946
+ShaderIncludeImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Includes/TemporalReprojection.hlsl
+  uploadId: 728261

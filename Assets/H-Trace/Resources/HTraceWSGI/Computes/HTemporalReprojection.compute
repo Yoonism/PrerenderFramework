@@ -1,0 +1,274 @@
+#pragma kernel ProbeReprojection
+#pragma kernel HistoryIndirectionScroll
+#pragma kernel HistoryIndirectionUpdate
+#pragma kernel HistoryProbeBuffersUpdate
+
+#pragma warning (disable : 3206)
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_ReprojectionCoord);
+H_TEXTURE(_ProbeWorldPosNormal_History);
+
+H_RW_TEXTURE(float4, _ReprojectionWeights_Output);
+H_RW_TEXTURE(float4, _PersistentReprojectionWeights_Output);
+H_RW_TEXTURE(uint2, _ReprojectionCoords_Output);
+H_RW_TEXTURE(uint2, _PersistentReprojectionCoord_Output);
+
+H_RW_TEXTURE_ARRAY(uint2, _HistoryIndirection);
+H_RW_TEXTURE_ARRAY(uint4, _ProbeWorldPosNormal_HistoryOutput);
+
+int _HistoryArrayIndex;
+
+
+// ------------------------ PROBE TEMPORAL REPROJECTION ------------------------
+[numthreads(8, 8, 1)]
+void ProbeReprojection(int3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    uint2 ProbeOffset;
+    float4 NormalDepthDownsampled = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy).xy), ProbeOffset);
+    
+    // Fill current frame data
+    CurrentFrameData CurrentData;
+    CurrentData.Normal =  NormalDepthDownsampled.xyz;
+    CurrentData.DepthRaw = NormalDepthDownsampled.w;
+    CurrentData.DepthLinear = LinearEyeDepth(CurrentData.DepthRaw, _ZBufferParams);
+    CurrentData.WorldPos = ComputeWorldSpacePosition((pixCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) / _ScreenSize.xy, CurrentData.DepthRaw, UNITY_MATRIX_I_VP);
+    CurrentData.WorldPos = GetAbsolutePositionWS(CurrentData.WorldPos);
+    CurrentData.AligmentZ = 1.0f - dot(-normalize((CurrentData.WorldPos) - _WorldSpaceCameraPos), CurrentData.Normal);
+    CurrentData.MovingPixel = (GetStencilValue(H_LOAD(_HTraceStencilBuffer, pixCoord.xy * float(_ProbeSize))) & 32) != 0;
+    
+    float4 RelaxedWeights[4]; // Relaxed weights are equal to reprojection weights but with a less strict normal cutoff
+    float4 ReprojectionWeights; float4 BilinearWeights;
+    int2 PersistentHistoryCoord; int2 ReprojectionCoord;
+
+    // Load and dilate motion vectors
+    float2 MotionVectors; float ClosestDepth = FLT_MAX;
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            uint2 Unused;
+            float2 MotionVectorsSample = HBUFFER_MOTION_VECTOR(pixCoord.xy * _ProbeSize + int2(x,y) * _ProbeSize);
+            float4 NormalDepthDownsampled = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy  + int2(x,y)).xy), Unused);
+            
+            if (NormalDepthDownsampled.w < ClosestDepth && NormalDepthDownsampled.w > 0)
+            {
+                ClosestDepth = NormalDepthDownsampled.w;
+                MotionVectors = MotionVectorsSample;
+            }
+        } 
+    }
+    
+    // Get initial reprojection (for N-1 frame) and bilinear reprojection weights
+    GetReprojectionCoord(pixCoord.xy, MotionVectors, BilinearWeights, ReprojectionCoord);
+    
+    // Reprojection weights start with simple bilinear weights and will be later multiplied by disocclusion rejection weights
+    RelaxedWeights[0] = BilinearWeights;
+    ReprojectionWeights = BilinearWeights;
+    PersistentHistoryCoord = ReprojectionCoord;
+    
+    // Find best reprojection offset based on the highest reprojection (still only bilinear) weight
+    uint2 ReprojectionOffsets[4] = {uint2(0, 0), uint2(1, 0), uint2(0, 1), uint2(1, 1)};
+    float BestReprojectionWeight = 0;
+    uint2 BestReprojectionOffset = 0;
+
+    // Cycle through all weigths
+    for (int i = 0; i < 4; i++)
+    {
+        if (ReprojectionWeights[i] > BestReprojectionWeight)
+        {
+            BestReprojectionWeight = ReprojectionWeights[i];
+            BestReprojectionOffset = ReprojectionOffsets[i];
+        }
+    }
+
+    // Get reprojection weights for N-1 frame
+    bool IsDisocclusion = GetReprojectionWeights(_ProbeWorldPosNormal_History, CurrentData, ReprojectionCoord, GetHistoryIndex(0), ReprojectionWeights, RelaxedWeights[0]);
+    float BestWeightSumm = ReprojectionWeights.x + ReprojectionWeights.y + ReprojectionWeights.z + ReprojectionWeights.w;
+    uint ReprojectionIndex = 0;
+
+    // If reprojection weights summ is 0 or reprojection coords lead outside probe atlas - it means we couldn't reproject N-1 frame
+    bool ReprojectionFailed = false;
+    int2 MaxAtlasReprojectionCoord = ReprojectionCoord * _OctahedralSize + BestReprojectionOffset * _OctahedralSize + _OctahedralSize;
+    if (any(MaxAtlasReprojectionCoord > _ScreenSize.xy / _ProbeSize * _OctahedralSize) || BestWeightSumm <= 0.1)
+        ReprojectionFailed = true;
+
+    // Output reprojection coords and weights and coords for N-1 frame
+    _ReprojectionWeights_Output[H_COORD(pixCoord.xy)] = ReprojectionWeights;
+    _ReprojectionCoords_Output[H_COORD(pixCoord.xy)] = PackReprojectionCoord(ReprojectionCoord, BestReprojectionOffset, ReprojectionFailed);
+    
+    uint MaxHistoryFrames = DISABLE_PROBE_JITTER ? 1 : _PersistentHistorySamples;
+    
+    // Search candidates in persistant history frames (up to N - MaxIterations), starting with (N-2)
+    for (uint t = 1; t < MaxHistoryFrames; t++)
+    {
+        // Good enough, stop the search
+        if (BestWeightSumm > 0.1)
+            break;
+    
+        RelaxedWeights[t] = BilinearWeights;
+        float4 SampleReprojectionWeights = BilinearWeights;
+    
+        // Get persistant history coordinates
+        int2 SamplePersistentHistoryCoord = asuint(H_LOAD_ARRAY(_HistoryIndirection, ReprojectionCoord, t).xy);
+    
+        // Calculate new reprojection weights
+        IsDisocclusion = GetReprojectionWeights(_ProbeWorldPosNormal_History, CurrentData, SamplePersistentHistoryCoord, GetHistoryIndex(t), SampleReprojectionWeights, RelaxedWeights[t]);
+        float SampleBestWeightSumm = SampleReprojectionWeights.x + SampleReprojectionWeights.y + SampleReprojectionWeights.z + SampleReprojectionWeights.w;
+    
+        // Accept this sample if it's better than previous samples
+        if (SampleBestWeightSumm > BestWeightSumm)
+        {
+            ReprojectionIndex = t;
+            BestWeightSumm = SampleBestWeightSumm;
+            ReprojectionWeights = SampleReprojectionWeights;
+            PersistentHistoryCoord = SamplePersistentHistoryCoord;
+    
+            // Prevents sampling outside of persistant history frames
+            if (SamplePersistentHistoryCoord.x + SamplePersistentHistoryCoord.y == 0)
+                ReprojectionWeights = 0;
+        }
+    }
+    
+    // Search reprojection candidate in 3x3 neighbourhood
+    if (REPROJECTION_AREA_SEARCH)
+    {
+        int2 BoxSampleOffsets[8] = {int2(0, 1), int2(1, 0),  int2(0, -1),  int2(-1, 0), int2(-1, 1), int2(-1, -1), int2(1, 1), int2(1, -1)};
+    
+        // Do the search only if the current reprojection weight is too low and it's not an obvious disocclusion
+        if (BestWeightSumm < 0.1 && !IsDisocclusion) 
+        {
+            for (uint i = 0; i < MaxHistoryFrames; i++)
+            {
+                for (int s = 0; s < 8; s++)
+                {
+                    int2 SampleReprojectionCoord;
+                    float4 SampleReprojectionWeights, WeightsUnused; 
+                    
+                    // Get new reprojection coordinates with offset
+                    GetReprojectionCoord(pixCoord.xy + BoxSampleOffsets[s], MotionVectors, SampleReprojectionWeights, SampleReprojectionCoord);
+                    int2 SamplePersistentHistoryCoord = asuint(H_LOAD_ARRAY(_HistoryIndirection, SampleReprojectionCoord, i));
+                    
+                    if (any(SampleReprojectionCoord * _OctahedralSize + int2(0, 0) * _OctahedralSize + _OctahedralSize >= _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+                        SampleReprojectionWeights.x = 0;
+                    
+                    if (any(SampleReprojectionCoord * _OctahedralSize + int2(1, 0) * _OctahedralSize + _OctahedralSize >= _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+                        SampleReprojectionWeights.y = 0;
+                    
+                    if (any(SampleReprojectionCoord * _OctahedralSize + int2(0, 1) * _OctahedralSize + _OctahedralSize >= _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+                        SampleReprojectionWeights.z = 0;
+                    
+                    if (any(SampleReprojectionCoord * _OctahedralSize + int2(1, 1) * _OctahedralSize + _OctahedralSize >= _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+                        SampleReprojectionWeights.w = 0;
+                    
+                    // Calculate new reprojection weights
+                    GetReprojectionWeights(_ProbeWorldPosNormal_History, CurrentData, SamplePersistentHistoryCoord, GetHistoryIndex(i), SampleReprojectionWeights, WeightsUnused);
+                    float SampleBestWeightSumm = SampleReprojectionWeights.x + SampleReprojectionWeights.y + SampleReprojectionWeights.z + SampleReprojectionWeights.w;
+    
+                    // Accept this sample if it's better than previous samples
+                    if (SampleBestWeightSumm > BestWeightSumm)
+                    {
+                        ReprojectionIndex = i;
+                        BestWeightSumm = SampleBestWeightSumm;
+                        ReprojectionWeights = SampleReprojectionWeights;
+                        PersistentHistoryCoord = SamplePersistentHistoryCoord;
+    
+                        // Prevents sampling outside of persistant history frames
+                        if (SamplePersistentHistoryCoord.x + SamplePersistentHistoryCoord.y == 0)
+                            ReprojectionWeights = 0;
+    
+                        // Good enough, stop the search
+                        if (SampleBestWeightSumm > 0.1)
+                            break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Use best relaxed weight (meaning soft normal cutoff) as a last-ditch effort
+    if (REPROJECTION_WITH_RELAXED_WEIGHTS)
+    {
+        for (uint i = 0; i < MaxHistoryFrames; i++)
+        {
+            // Good enough, stop the search
+            if (BestWeightSumm > 0.1)
+                break;
+                
+            float SampleBestWeightSumm = RelaxedWeights[i].x + RelaxedWeights[i].y + RelaxedWeights[i].z + RelaxedWeights[i].w;
+    
+            // Accept this sample if it's better than previous samples
+            if (SampleBestWeightSumm > BestWeightSumm)
+            {
+                ReprojectionIndex = i;
+                BestWeightSumm = SampleBestWeightSumm;
+                ReprojectionWeights = RelaxedWeights[i];
+                PersistentHistoryCoord = asuint(H_LOAD_ARRAY(_HistoryIndirection, ReprojectionCoord, i));
+    
+                // Prevents sampling outside of persistant history frames
+                if (PersistentHistoryCoord.x + PersistentHistoryCoord.y == 0)
+                    ReprojectionWeights = 0;
+            } 
+        }
+    }
+
+    if (any(PersistentHistoryCoord * _OctahedralSize + int2(0, 0) * _OctahedralSize + _OctahedralSize > _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+        ReprojectionWeights.x = 0;
+                    
+    if (any(PersistentHistoryCoord * _OctahedralSize + int2(1, 0) * _OctahedralSize + _OctahedralSize > _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+        ReprojectionWeights.y = 0;
+                    
+    if (any(PersistentHistoryCoord * _OctahedralSize + int2(0, 1) * _OctahedralSize + _OctahedralSize > _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+        ReprojectionWeights.z = 0;
+                    
+    if (any(PersistentHistoryCoord * _OctahedralSize + int2(1, 1) * _OctahedralSize + _OctahedralSize > _ScreenSize.xy / _ProbeSize * _OctahedralSize)) 
+        ReprojectionWeights.w = 0;
+    
+    // Output reprojection weights and coords
+    _PersistentReprojectionWeights_Output[H_COORD(pixCoord.xy)] = ReprojectionWeights;
+    _PersistentReprojectionCoord_Output[H_COORD(pixCoord.xy)] = PackPersistentReprojectionCoord(PersistentHistoryCoord, ReprojectionIndex);
+}
+
+
+// ------------------------ HISTORY INDIRECTION SCROLL ------------------------
+[numthreads(8, 8, 1)]
+void HistoryIndirectionScroll(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    uint2 BestOffset; bool ReprojectionFailed;
+    uint2 ReprojectionCoordPacked = asuint(H_LOAD(_ReprojectionCoord, pixCoord.xy).xy);
+    uint2 ReprojectionCoord = UnpackBestReprojectionCoord(ReprojectionCoordPacked, BestOffset, ReprojectionFailed);
+
+    _HistoryIndirection[uint3(pixCoord.xy, H_INDEX_ARRAY(_HistoryArrayIndex))] = asuint(H_LOAD_ARRAY(_HistoryIndirection, ReprojectionCoord + BestOffset, _HistoryArrayIndex - 1));
+}
+
+
+// ------------------------ HISTORY INDIRECTION UPDATE ------------------------
+[numthreads(8, 8, 1)]
+void HistoryIndirectionUpdate(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _HistoryIndirection[uint3(pixCoord.xy, H_INDEX_ARRAY(0))] = pixCoord.xy;
+}
+
+
+// ------------------------ HISTORY PROBE BUFFERS UPDATE ------------------------
+[numthreads(8, 8, 1)]
+void HistoryProbeBuffersUpdate(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    uint2 ProbeOffset;
+    float4 NormalDepthDownsampled = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy).xy), ProbeOffset);
+    float3 WorldPosition = ComputeWorldSpacePosition((pixCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) / _ScreenSize.xy, NormalDepthDownsampled.w, UNITY_MATRIX_I_VP);
+    WorldPosition = GetAbsolutePositionWS(WorldPosition);
+    
+    _ProbeWorldPosNormal_HistoryOutput[uint3(pixCoord.xy, H_INDEX_ARRAY(uint(_FrameCount) % _PersistentHistorySamples))] = PackWorldPosNormal(WorldPosition.xyz, NormalDepthDownsampled.xyz);
+}

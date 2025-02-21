@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 1e9f5070bb59d4749ac7ae2b066204d9
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Illumin/MK_Illumin-Glossy.shader
+  uploadId: 705540

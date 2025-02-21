@@ -1,0 +1,175 @@
+#pragma kernel GenerateDepthPyramid_1
+#pragma kernel GenerateDepthPyramid_2
+
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/RenderPass/CustomPass/CustomPassCommon.hlsl"
+#include "../Headers/HMain.hlsl"
+
+H_TEXTURE(_DepthIntermediate);
+
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP0);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP1);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP2);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP3);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP4);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP5);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP6);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP7);
+H_RW_TEXTURE(float, _DepthPyramid_OutputMIP8);
+H_RW_TEXTURE(float, _DepthIntermediate_Output);
+
+groupshared float MipDepthLDS[8][8];
+
+// ------------------------ MIP LEVEL 0-4 GENERATIONS ------------------------
+[numthreads(8, 8, 1)]
+void GenerateDepthPyramid_1(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    const uint2 baseCoord = pixCoord.xy;
+    pixCoord.xy = baseCoord * 2;
+
+    float Depth_00 = any(pixCoord.xy + uint2(0,0) >= uint2(_ScreenSize.xy)) ? 0 : HBUFFER_DEPTH(pixCoord.xy + uint2(0,0));
+    float Depth_10 = any(pixCoord.xy + uint2(1,0) >= uint2(_ScreenSize.xy)) ? 0 : HBUFFER_DEPTH(pixCoord.xy + uint2(1,0));
+    float Depth_01 = any(pixCoord.xy + uint2(0,1) >= uint2(_ScreenSize.xy)) ? 0 : HBUFFER_DEPTH(pixCoord.xy + uint2(0,1));
+    float Depth_11 = any(pixCoord.xy + uint2(1,1) >= uint2(_ScreenSize.xy)) ? 0 : HBUFFER_DEPTH(pixCoord.xy + uint2(1,1));
+
+    Depth_00 = Depth_00 >= 0.9999f ? 0 : Depth_00;
+    Depth_10 = Depth_10 >= 0.9999f ? 0 : Depth_10;
+    Depth_01 = Depth_01 >= 0.9999f ? 0 : Depth_01;
+    Depth_11 = Depth_11 >= 0.9999f ? 0 : Depth_11;
+    
+    // Write to MIP0
+    _DepthPyramid_OutputMIP0[H_COORD(pixCoord.xy + uint2(0, 0))] = Depth_00;
+    _DepthPyramid_OutputMIP0[H_COORD(pixCoord.xy + uint2(1, 0))] = Depth_10;
+    _DepthPyramid_OutputMIP0[H_COORD(pixCoord.xy + uint2(0, 1))] = Depth_01;
+    _DepthPyramid_OutputMIP0[H_COORD(pixCoord.xy + uint2(1, 1))] = Depth_11;
+
+    float DepthMIP1 = max(max(Depth_00, Depth_10), max(Depth_01, Depth_11));
+
+    // Write to MIP1
+    _DepthPyramid_OutputMIP1[H_COORD(baseCoord)] = DepthMIP1;
+
+    MipDepthLDS[groupThreadID.x][groupThreadID.y] = DepthMIP1;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Write to MIP2
+    [branch]
+    if (all((groupThreadID.xy % int2(2, 2)) == 0))
+    {
+        float DepthLDS_00 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 0];
+        float DepthLDS_10 = MipDepthLDS[groupThreadID.x + 1][groupThreadID.y + 0];
+        float DepthLDS_01 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 1];
+        float DepthLDS_11 = MipDepthLDS[groupThreadID.x + 1][groupThreadID.y + 1];
+
+        float DepthMIP2 = max(max(DepthLDS_00, DepthLDS_10), max(DepthLDS_01, DepthLDS_11));
+
+        _DepthPyramid_OutputMIP2[H_COORD(baseCoord / 2)] = DepthMIP2;
+        MipDepthLDS[groupThreadID.x][groupThreadID.y] = DepthMIP2;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Write to MIP3
+    [branch]
+    if (all((groupThreadID.xy % int2(4, 4)) == 0))
+    {
+        float DepthLDS_00 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 0];
+        float DepthLDS_10 = MipDepthLDS[groupThreadID.x + 2][groupThreadID.y + 0];
+        float DepthLDS_01 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 2];
+        float DepthLDS_11 = MipDepthLDS[groupThreadID.x + 2][groupThreadID.y + 2];
+
+        float DepthMIP3 = max(max(DepthLDS_00, DepthLDS_10), max(DepthLDS_01, DepthLDS_11));
+
+        _DepthPyramid_OutputMIP3[H_COORD(baseCoord / 4)] = DepthMIP3;
+        MipDepthLDS[groupThreadID.x][groupThreadID.y] = DepthMIP3;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Write to MIP4
+    [branch]
+    if (all((groupThreadID.xy % int2(8, 8)) == 0))
+    {
+        float DepthLDS_00 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 0];
+        float DepthLDS_10 = MipDepthLDS[groupThreadID.x + 4][groupThreadID.y + 0];
+        float DepthLDS_01 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 4];
+        float DepthLDS_11 = MipDepthLDS[groupThreadID.x + 4][groupThreadID.y + 4];
+        
+        float DepthMIP4 = max(max(DepthLDS_00, DepthLDS_10), max(DepthLDS_01, DepthLDS_11));
+        
+        _DepthPyramid_OutputMIP4[H_COORD(baseCoord / 8)] = DepthMIP4;
+        _DepthIntermediate_Output[H_COORD(baseCoord / 8)] = DepthMIP4;
+    }
+}
+
+
+// ------------------------ MIP LEVEL 5-7 GENERATIONS ------------------------
+[numthreads(8, 8, 1)]
+void GenerateDepthPyramid_2(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    const uint2 baseCoord = pixCoord.xy;
+    pixCoord.xy = baseCoord * 2;
+
+    float Depth_00 = H_LOAD_LOD(_DepthIntermediate, pixCoord.xy + uint2(0,0), 0).x;
+    float Depth_10 = H_LOAD_LOD(_DepthIntermediate, pixCoord.xy + uint2(1,0), 0).x;
+    float Depth_01 = H_LOAD_LOD(_DepthIntermediate, pixCoord.xy + uint2(0,1), 0).x;
+    float Depth_11 = H_LOAD_LOD(_DepthIntermediate, pixCoord.xy + uint2(1,1), 0).x;
+    
+    float DepthMIP5 = max(max(Depth_00, Depth_10), max(Depth_01, Depth_11));
+
+    // Write to MIP5
+    _DepthPyramid_OutputMIP5[H_COORD(baseCoord)] = DepthMIP5;
+    
+    MipDepthLDS[groupThreadID.x][groupThreadID.y] = DepthMIP5;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Write to MIP6
+    [branch]
+    if (all((groupThreadID.xy % int2(2, 2)) == 0))
+    {
+        float DepthLDS_00 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 0];
+        float DepthLDS_10 = MipDepthLDS[groupThreadID.x + 1][groupThreadID.y + 0];
+        float DepthLDS_01 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 1];
+        float DepthLDS_11 = MipDepthLDS[groupThreadID.x + 1][groupThreadID.y + 1];
+    
+        float DepthMIP6 = max(max(DepthLDS_00, DepthLDS_10), max(DepthLDS_01, DepthLDS_11));
+    
+        _DepthPyramid_OutputMIP6[H_COORD(baseCoord / 2)] = DepthMIP6;
+        MipDepthLDS[groupThreadID.x][groupThreadID.y] = DepthMIP6;
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Write to MIP7
+    [branch]
+    if (all((groupThreadID.xy % int2(4, 4)) == 0))
+    {
+        float DepthLDS_00 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 0];
+        float DepthLDS_10 = MipDepthLDS[groupThreadID.x + 2][groupThreadID.y + 0];
+        float DepthLDS_01 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 2];
+        float DepthLDS_11 = MipDepthLDS[groupThreadID.x + 2][groupThreadID.y + 2];
+    
+        float DepthMIP7 = max(max(DepthLDS_00, DepthLDS_10), max(DepthLDS_01, DepthLDS_11));
+    
+        _DepthPyramid_OutputMIP7[H_COORD(baseCoord / 4)] = DepthMIP7;
+        MipDepthLDS[groupThreadID.x][groupThreadID.y] = DepthMIP7;
+    }
+    
+    // GroupMemoryBarrierWithGroupSync();
+    //
+    // // Write to MIP8
+    // [branch]
+    // if (all((groupThreadID.xy % int2(8, 8)) == 0))
+    // {
+    //     float DepthLDS_00 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 0];
+    //     float DepthLDS_10 = MipDepthLDS[groupThreadID.x + 4][groupThreadID.y + 0];
+    //     float DepthLDS_01 = MipDepthLDS[groupThreadID.x + 0][groupThreadID.y + 4];
+    //     float DepthLDS_11 = MipDepthLDS[groupThreadID.x + 4][groupThreadID.y + 4];
+    //
+    //     float DepthMIP8 = max(max(DepthLDS_00, DepthLDS_10), max(DepthLDS_01, DepthLDS_11));
+    //
+    //     _DepthPyramid_OutputMIP8[H_COORD(baseCoord / 8)] = DepthMIP8;
+    // }
+}

@@ -1,0 +1,10 @@
+﻿fileFormatVersion: 2
+guid: 60e67611f90946ae80e841522eaf6dcb
+timeCreated: 1715450232
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Scripts/VoxelCameras/VoxelCullingCamera.cs
+  uploadId: 728261

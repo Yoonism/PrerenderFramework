@@ -1,0 +1,30 @@
+#pragma kernel Debug
+
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/RenderPass/CustomPass/CustomPassCommon.hlsl"
+#include "../Headers/HMain.hlsl"
+
+// Input bufferes
+H_TEXTURE(_HTraceBufferGI);
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_HTraceBufferVoxelVisualization);
+
+H_TEXTURE_2D(_HTraceShadowmap);
+
+// Output buffers
+H_RW_TEXTURE(float4, _Debug_Output);
+
+int _DebugModeEnumWS;
+
+[numthreads(8, 8, 1)]
+void Debug(uint3 pixCoord : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _Debug_Output[H_COORD(pixCoord.xy)] = H_LOAD(_HTraceBufferGI, pixCoord.xy);
+
+    if (_DebugModeEnumWS == 2)
+    _Debug_Output[H_COORD(pixCoord.xy)] = H_LOAD(_GeometryNormal, pixCoord.xy);
+    
+    if (_DebugModeEnumWS == 3)
+    _Debug_Output[H_COORD(pixCoord.xy)] = H_LOAD(_HTraceShadowmap, pixCoord.xy * (2048 / _ScreenSize.y));
+}

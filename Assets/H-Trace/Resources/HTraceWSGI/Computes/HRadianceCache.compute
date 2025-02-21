@@ -1,0 +1,382 @@
+#pragma kernel CacheDataUpdate
+#pragma kernel CachePrimarySpawn
+#pragma kernel CacheTracingUpdate
+#pragma kernel CacheLightEvaluation
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+#include "../Includes/SpatialHash.hlsl"
+#include "../Includes/VoxelLightingEvaluation.hlsl"
+#include "../Includes/SpatialFilteringFunctions.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Sampling/Sampling.hlsl"
+
+H_TEXTURE(_ReprojectionCoords);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_RadianceAtlas);
+
+H_RW_TEXTURE3D(float3, _RadianceCacheFiltered_Output);
+
+float _RayLength;
+
+uint _HashUpdateFrameIndex;
+uint _OctahedralSize;
+int _FreezeCache;
+int _ProbeSize;
+
+
+// ------------------------ FUNCTIONS --------------------------
+float3 AccumulateCache(float3 RadianceCurr, float3 RadiancePrev, float Min, float Max)
+{
+    if (!ADAPTIVE_TEMPORAL_WEIGHT)
+        return lerp(RadianceCurr, RadiancePrev, Max);
+        
+    float LumaCurr = Luminance(RadianceCurr / min(GetInverseCurrentExposureMultiplier(), 5.0f));
+    float LumaPrev = Luminance(RadiancePrev / min(GetInverseCurrentExposureMultiplier(), 5.0f));
+ 
+    float Difference = abs(LumaCurr - LumaPrev) / max(LumaCurr, max(LumaPrev, 0.2f));
+    float Weight = 1.0 - Difference;
+    float Feedback = lerp(Max, Min, Weight * Weight);
+    
+    return lerp(RadianceCurr, RadiancePrev, Feedback);
+}
+
+
+// ------------------------ CACHE SPAWN & UPDATE ON PRIMARY SURFACES --------------------------
+[numthreads(8, 8, 1)]
+void CachePrimarySpawn(uint3 pixCoord : SV_DispatchThreadID)
+{
+    // We jitter pixel every frame to cover full frame over time
+    float2 Jitter;
+    Jitter.x = GetBNDSequenceSample(pixCoord.xy, uint(_FrameCount) % 36, 3);
+    Jitter.y = GetBNDSequenceSample(pixCoord.xy, uint(_FrameCount) % 36, 4);
+    float2 PixelJitter = Jitter.xy * float(_ProbeSize);
+
+    uint2 ProbeOffset;
+    float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy).xy), ProbeOffset);
+    float3 WorldPos = ComputeWorldSpacePosition((pixCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw, NormalDepth.w, UNITY_MATRIX_I_VP);
+    float4 NormalPlane = float4(NormalDepth.xyz, dot(WorldPos, NormalDepth.xyz));
+    
+    float3 NormalJittered = H_LOAD(_GeometryNormal, pixCoord.xy * _ProbeSize + PixelJitter).xyz;
+    float DepthJitterd = HBUFFER_DEPTH(pixCoord.xy * _ProbeSize + PixelJitter);
+    float3 WorldPosJittered = ComputeWorldSpacePosition((pixCoord.xy * float(_ProbeSize) + float2(PixelJitter) + 0.5f) * _ScreenSize.zw, DepthJitterd, UNITY_MATRIX_I_VP);
+    
+    // Use the jittered position only if it's on the same plane with our initial positon 
+    if (ProbePlaneWeighting(NormalPlane, WorldPosJittered, LinearEyeDepth(NormalDepth.w, _ZBufferParams), 1000.0f) > 0.01) 
+    {
+        NormalDepth.xyz = NormalJittered;
+        NormalDepth.w = DepthJitterd;
+        WorldPos = WorldPosJittered;
+    }
+    
+    // Early out on skybox
+    if (NormalDepth.w <= 1e-7)
+        return;
+    
+    float4 CacheRadiance = 0;
+    
+    // Gather radiance and evaluate temporal invalidity acrosss an octahedral screen probe
+    for (uint x = 0; x < _OctahedralSize; x++)
+    {
+        for (uint y = 0; y < _OctahedralSize; y++)
+        {
+            uint2 TapCoord = pixCoord.xy * _OctahedralSize + uint2(x,y);
+         
+            // Calculate average ray direction for this octahedral cell
+            float3 RayDirection = OrientedOctahedronToDirection((float2(x, y) + 0.5f) / float(_OctahedralSize), NormalDepth.xyz);
+            
+            float4 RadianceSample = H_LOAD(_RadianceAtlas, TapCoord) * 2.0f * saturate(dot(RayDirection, NormalDepth.xyz));
+        
+            if (RadianceSample.w > 0)
+            CacheRadiance += float4(RadianceSample.xyz, 1);
+        }
+    }
+
+    // Average cache radiance
+    if (CacheRadiance.w > 0)
+        CacheRadiance.xyz /= CacheRadiance.w;
+
+    if (AnyIsNaN(CacheRadiance) || AnyIsInf(CacheRadiance))
+        CacheRadiance = 0;
+    
+    // Calculate cache coords from visible world space position of the primary surface
+    float3 AbsolutePositionWS = GetAbsolutePositionWS(WorldPos);
+    int3 HitCoord = floor((AbsolutePositionWS) * _VoxelPerMeter) + (_VoxelResolution.xzy / 2.0f);
+    int3 VoxelSpans = floor(HitCoord / (_VoxelResolution.xzy));
+    int3 CacheCoord = HitCoord - (VoxelSpans * _VoxelResolution.xzy);
+    
+    int3 VoxelCoordAbsolute = floor((AbsolutePositionWS) * _VoxelPerMeter);
+    float3 VoxelHitOffset = float3(VoxelCoordAbsolute) * _VoxelSize - AbsolutePositionWS;
+    
+    // Evaluate spatial hash
+    if (0) //!FREEZE_CACHE)
+    {
+        uint HashKey = PackHashKey(CacheCoord, NormalDepth.xyz);
+        
+        bool IsEmpty;
+        uint HashRank = 3;
+        uint HashProbingIndex, HashLowestRankIndex;
+        uint HashIndex = HashGetIndex(CacheCoord, PackVoxelNormalIndex(NormalDepth.xyz));
+        bool HashFound = HashFindAny(HashIndex, HashKey, HashRank, HashLowestRankIndex, HashProbingIndex, IsEmpty);
+        
+        if (HashFound)
+        {
+            // Load packed radiance cache
+            uint3 RadiancePacked = _HashBuffer_Radiance[HashProbingIndex].xyz;
+
+            // Unpack both near and full caches
+            float3 CacheRadianceFull = UnpackCacheRadianceFull(RadiancePacked.xyz);
+            float3 CacheRadianceNear = UnpackCacheRadianceNear(RadiancePacked.xyz);
+            
+            // Accumulate to full range radiance cache
+            CacheRadianceFull = AccumulateCache(CacheRadiance.xyz, CacheRadianceFull, 0.83f, 0.93f);
+            
+            _HashBuffer_Radiance[HashProbingIndex] = uint4(PackCacheRadiance(CacheRadianceFull, CacheRadianceNear), 0); 
+            _HashBuffer_Counter[HashProbingIndex] = 255;
+            _HashBuffer_Key[HashProbingIndex] = HashKey | 0x3; 
+        }
+        else if (IsEmpty) // If we didn't find a valid entry but found an empty cell, we spawn a new entry with radiance in it
+        {
+            _HashBuffer_Position[HashProbingIndex] = uint4(asuint(VoxelCoordAbsolute.xyz), PackHitOffset(VoxelHitOffset));
+            _HashBuffer_Radiance[HashProbingIndex] = 0; //uint4(PackCacheRadiance(CacheRadiance, 0), 0);
+            _HashBuffer_Counter[HashProbingIndex] = 255;
+            _HashBuffer_Key[HashProbingIndex] = HashKey | 0x3; 
+        }
+        else if (HashRank != 3) // If neither a valid nor an empty entry was found, we recycle the lowest ranked cell to spawn a new entry with radiance in it
+        {
+           _HashBuffer_Position[HashLowestRankIndex] = uint4(asuint(VoxelCoordAbsolute.xyz), PackHitOffset(VoxelHitOffset));
+           _HashBuffer_Radiance[HashLowestRankIndex] = 0; //uint4(PackCacheRadiance(CacheRadiance, 0), 0);
+           _HashBuffer_Counter[HashLowestRankIndex] = 255;
+           _HashBuffer_Key[HashLowestRankIndex] = HashKey | 0x3; 
+        }   
+    }
+}
+
+
+// ------------------------ CACHE TRACING UPDATE --------------------------
+[numthreads(64, 1, 1)]
+void CacheTracingUpdate(uint dispatchThreadId : SV_DispatchThreadID)
+{
+    uint PayloadIndex = dispatchThreadId.x;
+
+    // Offset index to process a new section of the hash
+    dispatchThreadId.x = dispatchThreadId.x + ((_HashUpdateFrameIndex % _HashUpdateFraction) * (_HashStorageSize / _HashUpdateFraction));
+
+    // Read our hash key
+    uint HashKey = _HashBuffer_Key[dispatchThreadId.x];
+
+    // Extract hash rank from hash key
+    int HashRank = HashKey & 0x3;
+    HashKey = HashKey & 0xFFFFFFFC;
+
+    // If hash key is 0 - it's an empty hash cell and we can early out
+    if (HashKey == 0 || FREEZE_CACHE)
+    {
+        _HashBuffer_Payload[PayloadIndex] = 0u;
+        return;
+    }
+    
+    // Unpack ray coord and normal from hash key
+    uint3 HitCoord = UnpackHitCoordFromHashKey(HashKey);
+    float3 HitNormal = UnpackHitNormalFromHashKey(HashKey);
+    
+    // Pick coordinates for random generator based on the normal
+    float3 HitNormalAbs = abs(HitNormal);
+    float HitNormalMax = max(max(HitNormalAbs.x, HitNormalAbs.y), HitNormalAbs.z);
+
+    // Swizzle coordinates for ray jitter based on the dominant normal
+    uint2 HitRandomCoord = 0;
+    if (HitNormalMax == HitNormalAbs.x)
+        HitRandomCoord = HitCoord.yz;
+    if (HitNormalMax == HitNormalAbs.y)
+        HitRandomCoord = HitCoord.xz;
+    if (HitNormalMax == HitNormalAbs.z)
+        HitRandomCoord = HitCoord.xy;
+
+    // Generate random ray jitter
+    float2 RayJitter;
+    RayJitter.x = GetBNDSequenceSample(HitRandomCoord, _FrameCount, 4);
+    RayJitter.y = GetBNDSequenceSample(HitRandomCoord, _FrameCount, 5);
+
+    // Calculate hash cell tracing position
+    uint4 HashPositionPacked = _HashBuffer_Position[dispatchThreadId.x].xyzw;
+    float3 RayOrigin = asint(HashPositionPacked.xyz) * _VoxelSize;
+   // RayOrigin += UnpackHitOffset(HashPositionPacked.w);
+    RayOrigin += 0.5 * _VoxelSize;
+
+    // Generate new ray direction
+    float3 RayDirection = SampleHemisphereCosine(RayJitter.x, RayJitter.y, HitNormal);
+
+    // Apply ray bias
+    RayOrigin += RayDirection * _VoxelSize * 0.5f;
+    RayOrigin += HitNormal * _VoxelSize * 0.5f; //(0.6f * (1.0f - max(0.0f, dot(RayDirection, HitNormal))));
+  
+    // Initialize voxel ray payload
+    VoxelPayload Payload;
+    InitializePayload(Payload);
+    
+    // Calculate ray distance
+    float MaxRayDistance = MaxVoxelRayDistance(RayOrigin, RayDirection);
+    float RayDistance = _RayLength == 0 ? MaxRayDistance : _RayLength;
+     
+    // Trace into voxels
+    bool HitFound = TraceVoxelsDiffuse(RayOrigin, RayDirection, RayDistance, 128, Payload);
+
+    // Evaluate sky occlusion
+    float SkyOcclusion = HitFound ? 1 : EvaluateDirectionalShadowOcclusion(RayOrigin + MaxRayDistance * RayDirection);
+
+    // Set hit flag (HitFound & short distance for near field split, !HitFound and direction up for skybox read)
+    bool HitFlag = false;
+    if (HitFound) HitFlag = (Payload.HitDistance < _VoxelSize.x * 4) ? true : false;
+    if (!HitFound) HitFlag = (dot(float3(0,1,0), RayDirection) > _SkyOcclusionCone + 0.05f) ? true : false;
+    
+    // Pack and write cache payload
+    float3 VoxelHitOffset = VoxelCoordToAbsoluteWorldPosition(Payload.HitCoord) - Payload.HitPosition;
+    _HashBuffer_Payload[PayloadIndex] = PackCacheHitPayload(VoxelHitOffset, RayDirection, Payload.HitNormal, Payload.HitCoord, SkyOcclusion, HashRank, HitFound, HitFlag);
+}
+
+
+// ------------------------ CACHE LIGHT EVALUATION --------------------------
+[numthreads(64, 1, 1)]
+void CacheLightEvaluation(uint dispatchThreadId : SV_DispatchThreadID)
+{
+    uint WriteIndex = dispatchThreadId.x + ((_HashUpdateFrameIndex % _HashUpdateFraction) * (_HashStorageSize / _HashUpdateFraction));
+
+    // Read packed cache payload
+    uint2 CachePayloadPacked = _HashBuffer_Payload[dispatchThreadId.x];
+
+    // If payload is 0 - it's an empty hash cell and we can early out
+    if (CachePayloadPacked.y == 0 || FREEZE_CACHE)
+        return;
+
+    // Initialize voxel payload
+    VoxelPayload Payload;
+    InitializePayload(Payload);
+
+    // Unpack cache payload
+    float3 RayDirection; float3 HitOffset; float SkyOcclusion; uint HashRank; bool HitFlag;
+    bool HitFound = UnpackCacheHitPayload(CachePayloadPacked, RayDirection, HitOffset, Payload.HitNormal, Payload.HitCoord, SkyOcclusion, HashRank, HitFlag);
+
+    // Calculate hit position
+    Payload.HitPosition = VoxelCoordToAbsoluteWorldPosition(Payload.HitCoord) + HitOffset;
+    
+    // This is our cached radiance that we aim to update
+    uint3 RadiancePacked = _HashBuffer_Radiance[WriteIndex].xyz;
+
+    // Deal with hash at the hit point
+    if (HitFound)
+    {
+        uint3 HitCacheCoord = ComputeRadianceCacheCoord(Payload.HitCoord);
+        uint HitHashKey = PackHashKey(HitCacheCoord, Payload.HitNormal); ;
+        
+        bool IsEmpty;
+        uint HitHashRank = HashRank;
+        uint HashProbingIndex, HashLowestRankIndex;
+        uint HashIndex = HashGetIndex(HitCacheCoord, PackVoxelNormalIndex(Payload.HitNormal));
+        bool HashFound = HashFindAny(HashIndex, HitHashKey, HitHashRank, HashLowestRankIndex, HashProbingIndex, IsEmpty);
+        
+        int3 VoxelCoordAbsolute = VoxelCoordToAbsoluteVoxelCoord(Payload.HitCoord); 
+        float3 VoxelHitOffset = (float3(VoxelCoordAbsolute) * _VoxelSize) - Payload.HitPosition;
+        
+        if (HashFound) // If a valid entry was found we use it to add cache to our ray origin radiance cell
+        {
+            Payload.HitCache = UnpackCacheRadianceFull(_HashBuffer_Radiance[HashProbingIndex].xyz); 
+        }
+        else if (IsEmpty) // && HashRank > 0)  // If we didn't find a valid entry but found an empty cell, we spawn a new entry 
+        {
+            _HashBuffer_Position[HashProbingIndex] = uint4(asuint(VoxelCoordAbsolute.xyz), PackHitOffset(VoxelHitOffset));
+            _HashBuffer_Radiance[HashProbingIndex] = 0;
+            _HashBuffer_Counter[HashProbingIndex] = 255;
+            _HashBuffer_Key[HashProbingIndex] = HitHashKey | max(0, HashRank - 1);
+        }
+        else if (HitHashRank != HashRank) // && HashRank > 0) // If neither a valid nor an empty entry was found, we recycle the lowest ranked cell to spawn a new entry
+        {
+            _HashBuffer_Position[HashLowestRankIndex] = uint4(asuint(VoxelCoordAbsolute.xyz), PackHitOffset(VoxelHitOffset));
+            _HashBuffer_Radiance[HashLowestRankIndex] = 0;
+            _HashBuffer_Counter[HashLowestRankIndex] = 255;
+            _HashBuffer_Key[HashLowestRankIndex] = HitHashKey | max(0, HashRank - 1);
+        } 
+    }
+    
+    // Evaluate lighting at hit point
+    bool DirectLightingHit = true;
+    if (HitFound)
+        DirectLightingHit = EvaluateHitLighting(Payload);
+    
+    // Evaluate sky lighting if missed
+    if (!HitFound && HitFlag)
+        Payload.HitColor += SAMPLE_TEXTURECUBE_ARRAY_LOD(_SkyTexture, H_SAMPLER_TRILINEAR_CLAMP, RayDirection, 0, 2).xyz * SkyOcclusion;
+
+    // Unpack both near and full caches
+    float3 CacheRadianceFull = UnpackCacheRadianceFull(RadiancePacked.xyz);
+    float3 CacheRadianceNear = UnpackCacheRadianceNear(RadiancePacked.xyz);
+
+    // Clip cache
+    Payload.HitCache *= GetCurrentExposureMultiplier();
+    Payload.HitCache = HClipRadiance(Payload.HitCache, 10);
+    Payload.HitCache *= GetInverseCurrentExposureMultiplier();
+
+    // Add cache
+    Payload.HitColor += Payload.HitCache * Payload.HitDiffuse;
+
+    // Accumulate to full range radiance cache
+    CacheRadianceFull = AccumulateCache(Payload.HitColor, CacheRadianceFull, MIN_TEMPORAL_WEIGHT, MAX_TEMPORAL_WEIGHT);
+    
+    // Accumulate to near range radiance cache
+    if (!DirectLightingHit || (!HitFound && HitFlag))
+    CacheRadianceNear = AccumulateCache(Payload.HitColor, CacheRadianceNear, 0.3f, 0.90f);
+
+    // Write updated cache
+    _HashBuffer_Radiance[WriteIndex] = uint4(PackCacheRadiance(CacheRadianceFull, CacheRadianceNear), 0);
+}
+
+
+// ------------------------ CACHE DATA UPDATE --------------------------
+[numthreads(64, 1, 1)]
+void CacheDataUpdate(uint dispatchThreadId : SV_DispatchThreadID)
+{
+    if (FREEZE_CACHE)
+        return;
+
+    // Load position buffer
+    float3 AbsoluteVoxelPosition = asint(_HashBuffer_Position[dispatchThreadId.x].xyz) * _VoxelSize  - _VoxelCameraPos.xyz;
+    
+    // Calculate voxel coord from position
+    int3 VoxelCoord = AbsoluteWorldPositionToVoxelCoord(AbsoluteVoxelPosition);
+
+    // If position.xyz is 0 - it's an empty hash cell and we can early out
+    if (AbsoluteVoxelPosition.x + AbsoluteVoxelPosition.y + AbsoluteVoxelPosition.z == 0)
+        return;
+    
+    // Use "VoxelOccupancy == 0" below to deallocate hash cells on moving objects. This has a perfromance impact.
+    uint VoxelOccupancy = H_LOAD3D_LOD(_VoxelPositionPyramid, VoxelCoord, 0); 
+
+    // Clear the cell in all hash buffers if its position is outside bounds and early out
+    if (!IsVoxelCoordInBounds(VoxelCoord) || VoxelOccupancy == 0 )
+    {
+        _HashBuffer_Radiance[dispatchThreadId.x] = 0;
+        _HashBuffer_Position[dispatchThreadId.x] = 0;
+        _HashBuffer_Counter[dispatchThreadId.x] = 0;
+        _HashBuffer_Key[dispatchThreadId.x] = 0;
+        return;
+    }
+
+    // Load other hash bufffers
+    uint HashKey = _HashBuffer_Key[dispatchThreadId.x];
+    
+    // Unpack and decrement decay counter
+    int DecayCounter = _HashBuffer_Counter[dispatchThreadId.x]; 
+    DecayCounter = max(0, DecayCounter - 1);
+    
+    // If the cache entry is old enough - lower its rank
+    if (DecayCounter <= 200)
+    {
+        int Rank = HashKey & 0x3; // Must keep it as int
+        
+        // Lower cache rank
+        _HashBuffer_Key[dispatchThreadId.x] = (HashKey & 0xFFFFFFFC) | max(0, Rank - 1);
+    }
+    
+    // Update decay counter
+    _HashBuffer_Counter[dispatchThreadId.x] = DecayCounter;
+}

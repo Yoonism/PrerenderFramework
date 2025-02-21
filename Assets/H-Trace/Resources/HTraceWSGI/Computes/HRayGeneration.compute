@@ -1,0 +1,147 @@
+#pragma kernel RayGeneration
+#pragma kernel RayCompaction
+#pragma kernel IndirectArguments
+
+#include "../Includes/Config.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/RenderPass/CustomPass/CustomPassCommon.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/Raytracing/Shaders/RaytracingSampling.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+
+
+H_TEXTURE(_HitDistance);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_ReprojectionCoords);
+
+H_RW_TEXTURE(float, _HitDistance_Output);
+H_RW_TEXTURE(float4, _RayDirectionsJittered_Output);
+
+RWStructuredBuffer<uint> _RayCounter;
+RWStructuredBuffer<uint2> _TracingCoords;
+
+RWStructuredBuffer<uint> _RayCounter_Output;
+RWStructuredBuffer<uint> _TracingRayCounter_Output;
+RWStructuredBuffer<uint> _IndirectArguments_Output;
+
+RWStructuredBuffer<uint2> _TracingCoords_Output;
+RWStructuredBuffer<uint2> _IndirectCoordsSS_Output;
+RWStructuredBuffer<uint2> _IndirectCoordsOV_Output;
+RWStructuredBuffer<uint2> _IndirectCoordsSF_Output;
+
+int _IndexXR;
+int _HFrameIndex;
+uint _RayCounterIndex;
+uint _ReprojectSkippedFrame;
+
+
+// ------------------------ RAY COMPACTION -------------------------
+[numthreads(8, 8, 1)]
+void RayCompaction(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint ArrayOffsetXR = _ScreenSize.x * _ScreenSize.y;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[0 + 4 + 10 * _IndexXR])
+    return;
+
+    pixCoord.xy = _TracingCoords[RayIndex + ArrayOffsetXR * _IndexXR];
+    
+    bool Unused, TraceWorldRay;
+    uint HitDistancePacked = asuint(H_LOAD(_HitDistance, pixCoord.xy).x);
+    float HitDistance = UnpackHitDistance(HitDistancePacked, Unused, TraceWorldRay);
+    
+    if (TraceWorldRay)
+    {
+        uint Index = 0;
+        InterlockedAdd(_TracingRayCounter_Output[0 + 10 * _IndexXR], 1, Index);
+        _TracingCoords_Output[Index + ArrayOffsetXR * _IndexXR] = pixCoord.xy;
+    }
+    
+    _HitDistance_Output[H_COORD(pixCoord.xy)] = HitDistance; 
+}
+
+
+// ------------------------ INDIRECT ARGUMENTS GENERATION -------------------------
+[numthreads(1, 1, 1)]
+void IndirectArguments(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint2 groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    uint IndirectArgumentsOffsetVR = 3 * pixCoord.z;
+    uint RayCounterOffsetVR = 10 * pixCoord.z;
+    
+    uint RayCounterBuffer = _RayCounter[_RayCounterIndex + RayCounterOffsetVR];
+    
+    _IndirectArguments_Output[0 + IndirectArgumentsOffsetVR] = (RayCounterBuffer + 63) / 64;
+    _IndirectArguments_Output[1 + IndirectArgumentsOffsetVR] = 1;	
+    _IndirectArguments_Output[2 + IndirectArgumentsOffsetVR] = 1;
+    
+    _RayCounter[_RayCounterIndex + 0 + RayCounterOffsetVR] = 0;
+    _RayCounter[_RayCounterIndex + 4 + RayCounterOffsetVR] = RayCounterBuffer;
+}
+
+
+// ------------------------ RAY GENERATION -------------------------
+[numthreads(8, 8, 1)]
+void RayGeneration(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint2 groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    uint IndirectCoordOffsetVR =  _ScreenSize.x * _ScreenSize.y * pixCoord.z;
+    uint RayCounterOffsetVR = 10 * pixCoord.z;
+    
+    // Calculate probe and cell coord
+    uint2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    float2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+
+    // Load depth and normal
+    uint2 Unused;
+    float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, ProbeCoord).xy), Unused);
+ 
+    // Early out on the skybox
+    if (NormalDepth.w <= 1e-7)
+      return;
+
+    // Generate ray jitter for tracing direction
+    float2 RayJitter;
+    RayJitter.x = GetBNDSequenceSample(pixCoord.xy, _HFrameIndex, 0);
+    RayJitter.y = GetBNDSequenceSample(pixCoord.xy, _HFrameIndex, 1);
+    
+    // Calculate jittered ray direction for the octahedral cell
+    float3 OctahedralDirectionJittered = OrientedOctahedronToDirection(float2(CellCoord + RayJitter) / float(_OctahedralSize), NormalDepth.xyz);
+
+    uint2 BestOffset; bool ReprojectionFailed;
+    uint2 ReprojectionCoordPacked = asuint(H_LOAD(_ReprojectionCoords, ProbeCoord).xy);
+    uint2 ReprojectionCoord = UnpackBestReprojectionCoord(ReprojectionCoordPacked, BestOffset, ReprojectionFailed);
+    
+    bool CullCheckerboard = false;
+    if (((pixCoord.x + pixCoord.y) % 2 == 0 && uint(_FrameCount) % 2 == 0) || ReprojectionFailed)
+        CullCheckerboard = true;
+    if (((pixCoord.x + pixCoord.y) % 2 != 0 && uint(_FrameCount) % 2 != 0) || ReprojectionFailed)
+        CullCheckerboard = true;
+    
+    // Tracing indirection
+    if (CullCheckerboard)
+    {
+        uint Index = 0;
+        InterlockedAdd(_RayCounter_Output[0 + RayCounterOffsetVR], 1, Index);
+        _IndirectCoordsSS_Output[Index + IndirectCoordOffsetVR] = pixCoord.xy;
+    }
+    
+    // Occlusion validation indirection
+    if (CullCheckerboard)  
+    {
+        uint Index = 0; 
+        InterlockedAdd(_RayCounter_Output[1 + RayCounterOffsetVR], 1, Index);
+        _IndirectCoordsOV_Output[Index + IndirectCoordOffsetVR] = pixCoord.xy;
+    }
+    
+    // Spatial filer indirection
+    if (ReprojectionFailed)  
+    {
+        uint Index = 0; 
+        InterlockedAdd(_RayCounter_Output[2 + RayCounterOffsetVR], 1, Index);
+        _IndirectCoordsSF_Output[Index + IndirectCoordOffsetVR] = pixCoord.xy;
+    }
+
+    // Output jittered ray directions
+    _RayDirectionsJittered_Output[H_COORD(pixCoord.xy)] = float4(OctahedralDirectionJittered * 0.5f + 0.5f, 1);
+}

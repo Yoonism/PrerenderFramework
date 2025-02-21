@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: c9e2a6284d11f33499a073d3808a4fb6
+ComputeShaderImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Computes/HDepthPyramid.compute
+  uploadId: 728261

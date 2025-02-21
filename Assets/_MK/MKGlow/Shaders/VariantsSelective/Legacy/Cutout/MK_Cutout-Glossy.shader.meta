@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 9eeb8bb0d16a15a4689fd124c301013d
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Cutout/MK_Cutout-Glossy.shader
+  uploadId: 705540

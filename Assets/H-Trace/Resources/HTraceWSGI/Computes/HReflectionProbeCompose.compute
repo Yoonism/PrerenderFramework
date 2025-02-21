@@ -1,0 +1,147 @@
+#pragma kernel RenderVoxelsForReflectionProbes
+
+#include "../Includes/Config.hlsl"
+#include "../Headers/HPacking.hlsl"
+#include "../Includes/SpatialHash.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+
+// Output Buffers
+H_RW_TEXTURE(float3, _Output);
+
+[numthreads(8, 8, 1)]
+void RenderVoxelsForReflectionProbes(uint3 pixCoord : SV_DispatchThreadID)
+{
+	// Get world space position
+	float3 WorldPosition = ComputeWorldSpacePosition((pixCoord.xy + 0.5) * _ScreenSize.zw, HBUFFER_DEPTH(pixCoord.xy), UNITY_MATRIX_I_VP);
+	float3 AbsolutePositionWS = GetAbsolutePositionWS(WorldPosition);
+
+	// Calculate voxel coord from position
+	int3 VoxelBoxCenter = int3(_VoxelResolution.xzy / 2);
+	int3 VoxelPosition = floor((AbsolutePositionWS - _VoxelCameraPos) / _VoxelSize);
+	float3 VoxelCoord =  VoxelBoxCenter + VoxelPosition;
+
+	// Load normal
+	float3 Normal = HBUFFER_NORMAL_WS(pixCoord.xy);
+	float3 NormalAbs = abs(Normal);
+	float NormalMax = max(max(NormalAbs.x, NormalAbs.y), NormalAbs.z);
+	
+	float3 CacheNormal = 0;
+	float3 CacheNormalSign = 0;
+	float3 GatherDirection = 0;
+	
+	if (NormalMax == NormalAbs.x)
+	{
+		CacheNormal = float3(1,0,0);
+		GatherDirection = float3(0,1,1);
+		CacheNormalSign.x = sign(Normal.x);
+	}
+	if (NormalMax == NormalAbs.y)
+	{
+		CacheNormal = float3(0,1,0);
+		GatherDirection = float3(1,0,1);
+		CacheNormalSign.y = sign(Normal.y);
+	
+	}
+	if (NormalMax == NormalAbs.z)
+	{
+		CacheNormal = float3(0,0,1);
+		GatherDirection = float3(1,1,0);
+		CacheNormalSign.z = sign(Normal.z);
+	}
+	
+	// Offsets used for gather
+	int2 Offsets5x5[25] =  {int2( 0,  0), int2( 0,  1),	int2( 1,  0), int2( 1,  1),	int2(-1,  0),
+							int2(-1,  1), int2(-1, -1),	int2( 0, -1), int2( 1, -1),	int2(-2,  0),
+							int2( 0, -2), int2( 2,  0),	int2( 0,  2), int2(-1,  2),	int2(-2,  1),
+							int2( 1, -2), int2( 2, -1),	int2(-2, -1), int2(-1, -2),	int2( 2,  1),
+							int2( 1,  2), int2(-2,  2),	int2( 2,  2), int2( 2, -2),	int2(-2, -2)};
+
+
+	// Check neighbours for occlusions
+	if (OCCLUSION_CHECK)
+	{
+		int2 Offsets3x3[12] = {	int2( 0,  1), int2( 1,  0), int2( 1,  1), int2(-1,  0),
+								int2(-1,  1), int2(-1, -1), int2( 0, -1), int2( 1, -1),
+								int2(-2,  0), int2( 2,  0), int2( 0, -2), int2( 0,  2) };
+		
+		for (int i = 0; i < 12; i++)
+		{
+			float3 Offset;
+			Offset.x = Offsets3x3[i].x;
+			Offset.y = Offsets3x3[i].y;
+			Offset.z = Offsets3x3[i][GatherDirection.x];
+	
+			Offset.x *= GatherDirection.x;
+			Offset.y *= GatherDirection.y;
+			Offset.z *= GatherDirection.z;
+			
+			uint VoxelOccupancy = asuint(H_LOAD3D_LOD(_VoxelPositionPyramid, VoxelCoord + Offset + float3(1,1,1) * CacheNormal * CacheNormalSign, 0));
+		
+			if (VoxelOccupancy > 0)
+			{
+				Offsets5x5[i + 1] = 0; 
+			
+				if (i == 0) { Offsets5x5[13] = 0; Offsets5x5[12] = 0; Offsets5x5[20] = 0; }
+				if (i == 1) { Offsets5x5[19] = 0; Offsets5x5[11] = 0; Offsets5x5[16] = 0; }
+				if (i == 2) { Offsets5x5[20] = 0; Offsets5x5[22] = 0; Offsets5x5[19] = 0; }
+				if (i == 3) { Offsets5x5[14] = 0; Offsets5x5[ 9] = 0; Offsets5x5[17] = 0; }
+				if (i == 4) { Offsets5x5[13] = 0; Offsets5x5[21] = 0; Offsets5x5[14] = 0; }
+				if (i == 5) { Offsets5x5[17] = 0; Offsets5x5[24] = 0; Offsets5x5[18] = 0; }
+				if (i == 6) { Offsets5x5[18] = 0; Offsets5x5[10] = 0; Offsets5x5[15] = 0; }
+				if (i == 7) { Offsets5x5[15] = 0; Offsets5x5[23] = 0; Offsets5x5[16] = 0; }
+			
+				if (i ==  8) { Offsets5x5[14] = 0; Offsets5x5[ 9] = 0; Offsets5x5[17] = 0; }
+				if (i ==  9) { Offsets5x5[19] = 0; Offsets5x5[11] = 0; Offsets5x5[16] = 0; }
+				if (i == 10) { Offsets5x5[18] = 0; Offsets5x5[10] = 0; Offsets5x5[15] = 0; }
+				if (i == 11) { Offsets5x5[13] = 0; Offsets5x5[12] = 0; Offsets5x5[20] = 0; }
+			}	
+		}	
+	}
+
+
+	float3 AccumulateCache = 0;
+	float AccumulatedWeight = 0;
+
+	// Accumulate radiance cache spatially
+	for (int i = 0; i < SPATIAL_SAMPLES; i++)
+	{
+		int3 SampleCoord = VoxelCoord;
+
+		// Apply sample offset
+		float3 Offset;
+		Offset.x = Offsets5x5[i].x;
+		Offset.y = Offsets5x5[i].y;
+		Offset.z = Offsets5x5[i][GatherDirection.x]; 
+
+		// Apply per-pixel jitter
+		float PixelJitter = GetBNDSequenceSample(pixCoord.xy, _FrameCount * JITTER_TEMPORAL, 0);
+		Offset.x += Offsets5x5[PixelJitter * JITTER_STRENGTH].x;
+		Offset.y += Offsets5x5[PixelJitter * JITTER_STRENGTH].y;
+		Offset.z += Offsets5x5[PixelJitter * JITTER_STRENGTH][GatherDirection.x]; 
+
+		SampleCoord.x += Offset.x * GatherDirection.x;
+		SampleCoord.y += Offset.y * GatherDirection.y;
+		SampleCoord.z += Offset.z * GatherDirection.z;
+
+		// Get hash cell
+		uint HashIndex = HashGetIndex(ComputeRadianceCacheCoord(SampleCoord), PackVoxelNormalIndex(Normal));
+
+		uint HashIndexFound;
+		uint HashKey = PackHashKey(ComputeRadianceCacheCoord(SampleCoord), Normal);
+		bool HashFound = HashFindValid(HashIndex, HashKey, HashIndexFound);
+
+		if (HashFound)
+		{
+			float3 RadianceCacheSample = UnpackCacheRadianceFull(_HashBuffer_Radiance[HashIndexFound].xyz); 
+			AccumulateCache += RadianceCacheSample * GetCurrentExposureMultiplier();
+			AccumulatedWeight += 1;
+		}
+	}
+
+	// Normalize
+	if (AccumulatedWeight > 0)
+	AccumulateCache /= AccumulatedWeight;
+	
+	// Combine and output
+	_Output[H_COORD(pixCoord.xy)] = AccumulateCache * HBUFFER_DIFFUSE(pixCoord.xy).xyz + HBUFFER_COLOR(pixCoord.xy).xyz;  
+}

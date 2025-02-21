@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: 0f9fab1ea0928f24a84c9bada8426f6e
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/UI/UI-Default.shader
+  uploadId: 705540

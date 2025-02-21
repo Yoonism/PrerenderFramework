@@ -1,0 +1,20 @@
+#include "../Headers/HMain.hlsl"
+#include "../Headers/HPacking.hlsl"
+
+#pragma kernel DebugPassthrough
+
+H_TEXTURE(_InputA);
+H_TEXTURE(_InputB);
+H_TEXTURE(_ReprojectionCoords);
+
+H_RW_TEXTURE(float3, _Output);
+H_TEXTURE_UINT2(_HTraceStencilBuffer);
+
+[numthreads(8, 8, 1)]
+void DebugPassthrough(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _Output[H_COORD(pixCoord.xy)] = H_LOAD(_InputA, pixCoord.xy).xyz ;
+
+}

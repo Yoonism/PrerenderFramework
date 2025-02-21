@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 896d92b4f12d20b4da8b17fbc723722a
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 8574412962073106934
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Sample Scene (Cornell Box)/Terrain/Layers/LayerSoil.terrainlayer
+  uploadId: 728261

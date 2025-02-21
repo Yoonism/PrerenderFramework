@@ -1,0 +1,294 @@
+#pragma kernel SpatialPrepass
+#pragma kernel GeometryNormals
+#pragma kernel GBufferDownsample
+#pragma kernel PointDistributionFill
+#pragma kernel SpatialOffsetsBufferFill
+#pragma kernel GeometryNormalsSmoothing
+
+#pragma multi_compile _ USE_DIRECTIONAL_OCCLUSION
+#pragma multi_compile _ DIFFUSE_BUFFER_UNAVAILABLE
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+#include "../Includes/SpatialFilteringFunctions.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/Raytracing/Shaders/RaytracingSampling.hlsl"
+
+H_TEXTURE(_SSAO);
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_ProbeAmbientOcclusion);
+H_TEXTURE(_NormalDepthDownsampled);
+
+H_RW_TEXTURE_ARRAY(uint4, _SpatialOffsets_Output);
+H_RW_TEXTURE_ARRAY(uint4, _SpatialWeights_Output);
+
+H_RW_TEXTURE(float, _ProbeSSAO_Output);
+H_RW_TEXTURE(float3, _ProbeDiffuse_Output);
+H_RW_TEXTURE(float4, _GeometryNormal_Output);
+H_RW_TEXTURE(uint2, _ProbeNormalDepth_Output);
+
+StructuredBuffer<float2> _PointDistribution;
+StructuredBuffer<int2> _SpatialOffsetsBuffer;
+RWStructuredBuffer<float2> _PointDistribution_Output;
+RWStructuredBuffer<int2> _SpatialOffsetsBuffer_Output;
+
+uint _DiffuseBufferUnavailable;
+
+void ClearArrays(inout int2 SampleCoords[8], inout float SampleWeights[8])
+{
+    for (int i = 0; i < 8; i++)
+    {
+        SampleCoords[i] = int2(0, 0);
+        SampleWeights[i] = 0.0f;
+    }
+}
+
+
+// ------------------------ POINT DISTRIBUTION BUFFER ------------------------
+[numthreads(128, 1, 1)]
+void PointDistributionFill(uint pixCoord : SV_DispatchThreadID)
+{
+    _PointDistribution_Output[pixCoord.x] = HSampleDiskCubic(GetLDSequenceSampleFloat(pixCoord.x, 0), GetLDSequenceSampleFloat(pixCoord.x, 1));
+}
+
+
+// ------------------------ SPATIAL OFFSETS BUFFER ------------------------
+[numthreads(1, 1, 1)]
+void SpatialOffsetsBufferFill(uint pixCoord : SV_DispatchThreadID)
+{
+    int2 SampleOffsets[80] =   {int2( 0,  1), int2( 1,  0), int2( 1,  1), int2(-1,  0), int2(-1,  1), int2(-1, -1), int2( 0, -1), int2( 1, -1),
+                                int2(-2,  0), int2( 0, -2), int2( 2,  0), int2( 0,  2), int2(-1,  2), int2(-2,  1), int2( 1, -2), int2( 2, -1),
+                                int2(-2, -1), int2(-1, -2), int2( 2,  1), int2( 1,  2), int2(-2,  2), int2( 2,  2), int2( 2, -2), int2(-2,  2),
+                                int2( 0, -3), int2( 0,  3), int2(-3,  0), int2( 3,  0), int2(-3, -1), int2( 3,  1), int2(-1, -3), int2( 1,  3),
+                                int2(-3,  1), int2( 3, -1), int2(-1,  3), int2( 1, -3), int2(-2,  3), int2( 3, -2), int2( 3,  2), int2(-3, -2),
+                                int2( 2,  3), int2(-2, -3), int2(-3,  2), int2( 2, -3), int2(-3,  3), int2( 3, -3), int2( 3,  3), int2(-3, -3),
+                                int2( 0,  4), int2( 0, -4), int2(-4,  0), int2( 4,  0), int2(-4,  1), int2( 1, -4), int2(-1,  4), int2( 4, -1),
+                                int2(-4,  1), int2( 1,  4), int2(-1, -4), int2( 4,  1), int2(-4,  2), int2( 4,  2), int2( 4, -2), int2(-4,  2),
+                                int2( 2, -4), int2(-2,  4), int2(-2, -4), int2( 2,  4), int2(-3, -4), int2( 4,  3), int2(-4, -3), int2( 3,  4),
+                                int2( 3, -4), int2(-4,  3), int2( 4, -3), int2(-3,  4), int2( 4, -4), int2(-4, -4), int2( 4,  4), int2(-4,  4)};
+
+    for (int i = 0; i < 80; i++)
+    {
+        _SpatialOffsetsBuffer_Output[i] = SampleOffsets[i];
+    }
+}
+
+
+// ------------------------ GEOMETRY NORMALS  ------------------------
+[numthreads(8, 8, 1)]
+void GeometryNormals(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    float3 GeometryNormal = HBUFFER_GEOMETRICAL_NORMAL_FROM_DEPTH(pixCoord.xy);
+    _GeometryNormal_Output[H_COORD(pixCoord.xy)] = float4(GeometryNormal, 1);
+}
+
+
+// ------------------------ GBUFFER DOWNSAMPLE ------------------------
+[numthreads(8, 8, 1)]
+void GBufferDownsample(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    uint2 ProbeOffset = CalculateHaltonSequence(uint(_FrameCount) % _PersistentHistorySamples) * float(_ProbeSize);
+
+    if (DISABLE_PROBE_JITTER)
+        ProbeOffset = uint2(0,0);
+    
+    float Depth = HBUFFER_DEPTH(pixCoord.xy * _ProbeSize + ProbeOffset);
+    float3 GeometryNormal = H_LOAD(_GeometryNormal, pixCoord.xy * _ProbeSize + ProbeOffset).xyz;
+    float3 Diffuse = float3(1.0f, 1.0f, 1.0f);
+
+    if (!DIFFUSE_BUFFER_UNAVAILABLE)
+        Diffuse = HBUFFER_DIFFUSE(pixCoord.xy * _ProbeSize + ProbeOffset).xyz;
+
+    if (USE_DIRECTIONAL_OCCLUSION)
+        _ProbeSSAO_Output[H_COORD(pixCoord.xy)] = H_LOAD(_SSAO, pixCoord.xy * _ProbeSize + ProbeOffset).w; 
+
+    _ProbeDiffuse_Output[H_COORD(pixCoord.xy)] = Diffuse;
+    _ProbeNormalDepth_Output[H_COORD(pixCoord.xy)] = PackNormalDepth2(GeometryNormal, Depth, ProbeOffset);
+}
+
+
+// ------------------------ SMOOTH GEOMETRY NORMALS ------------------------
+[numthreads(8, 8, 1)]
+void GeometryNormalsSmoothing(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    uint2 ProbeOffset;
+    float4 NormalDepthCenter = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy).xy), ProbeOffset);
+    float3 WorldPosCenter = ComputeWorldSpacePosition((pixCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw, NormalDepthCenter.w, UNITY_MATRIX_I_VP);
+    
+    float3 NormalGathered = NormalDepthCenter.xyz;
+    
+    for (int x = -4; x <= 4; x++)
+    {
+        for (int y = -5; y <= 4; y++)
+        {
+            if (x == 0 && y == 0)
+                continue;
+            
+            int2 TapOffset = int2(x,y);
+            int2 TapCoord = pixCoord.xy + TapOffset;
+    
+            // if (any(TapCoord.xy < 0) || any(TapCoord.xy > _ScreenSize.xy * _ProbeSize))
+            //     continue;
+    
+            uint2 ProbeOffset;
+            float4 NormalDepthSample = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, TapCoord.xy).xy), ProbeOffset);
+            float3 WorldPosSample = ComputeWorldSpacePosition((TapCoord * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw, NormalDepthSample.w, UNITY_MATRIX_I_VP);
+    
+            float NormalWeight = saturate(dot(NormalDepthCenter.xyz, NormalDepthSample.xyz));
+            float PlaneWeight = PlaneWeighting(WorldPosCenter, WorldPosSample, NormalDepthCenter.xyz, NormalDepthSample.xyz, 1);
+        
+            NormalGathered += NormalDepthSample.xyz * PlaneWeight * pow(NormalWeight, 2);
+        }
+    }
+    
+    float3 NormalDepthSmoothed = SafeNormalize(NormalGathered);
+    
+    _ProbeNormalDepth_Output[H_COORD(pixCoord.xy)] = PackNormalDepth2(NormalDepthSmoothed.xyz, NormalDepthCenter.w, ProbeOffset);
+}
+
+
+// ------------------------ FILTERING WEIGHTS & OFFSETS RPEPASS ------------------------
+[numthreads(8, 8, 1)]
+void SpatialPrepass(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Load center pixel data
+    uint2 ProbeOffset;
+    float4 NormalDepthCenter = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy).xy), ProbeOffset);
+    float2 pixCoordNDC = (pixCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw;
+    
+    float2 AmbientOcclusion = UnpackProbeAO(asuint(H_LOAD(_ProbeAmbientOcclusion, pixCoord.xy).x), PROBE_AO_MAX_TEMPORAL_SAMPLES);
+    float3 WorldPosCenter = ComputeWorldSpacePosition(pixCoordNDC, NormalDepthCenter.w, UNITY_MATRIX_I_VP);
+    float4 NormalPlane = float4(NormalDepthCenter.xyz, dot(WorldPosCenter, NormalDepthCenter.xyz));
+    float3 NormalCenter = NormalDepthCenter.xyz;
+
+    // Prepare offset and weight buffers
+    int2 BoxTapOffsets[8] = {int2(0, 1), int2(1, 0),  int2(0, -1),  int2(-1, 0), int2(-1, 1), int2(-1, -1), int2(1, 1), int2(1, -1)};
+    int2 SampleOffsetsX8[8] = {int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0), int2(0, 0)};
+    float SampleWeightsX8[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    
+    // -------------------------- BOX PASS -------------------------- //
+    int NumSamplesFound = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        // if (NumSamplesFound >= 8) 
+        //     break;
+        
+        int2 TapOffset = BoxTapOffsets[i];
+        int2 TapCoord = pixCoord.xy + TapOffset;
+        
+        // if (any(TapCoord.xy < 0) || any(TapCoord.xy > _ScreenSize.xy * _ProbeSize)) // TODO: do we need this?
+        //     continue;
+
+        uint2 ProbeOffset;
+        float4 NormalDepthSample = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, TapCoord).xy), ProbeOffset);
+        float3 WorldPosSample = ComputeWorldSpacePosition((TapCoord * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw, NormalDepthSample.w, UNITY_MATRIX_I_VP);
+        
+        float NormalWeight = saturate(dot(NormalCenter, NormalDepthSample.xyz));
+        float PlaneWeight = ProbePlaneWeighting(NormalPlane, WorldPosSample, LinearEyeDepth(NormalDepthSample.w, _ZBufferParams), 1000.0f);
+        //PlaneWeight = PlaneWeighting(WorldPosCenter, WorldPosSample, NormalCenter, NormalDepthSample.xyz, 4);
+            
+        float Weight = NormalWeight * PlaneWeight;
+
+        // if (Weight > BOX_FILTER_MINIMUM_ACCEPT_WEIGHT)
+        // {
+        //     SampleOffsetsX8[NumSamplesFound] = TapCoord - pixCoord.xy;
+        //     SampleWeightsX8[NumSamplesFound] = Weight;
+        //     NumSamplesFound++;  
+        // }
+
+        SampleOffsetsX8[i] = TapCoord - pixCoord.xy;
+        SampleWeightsX8[i] = Weight;
+    }
+
+    _SpatialWeights_Output[uint3(pixCoord.xy, H_INDEX_ARRAY(0))] = PackFilteringWeightsX8(SampleWeightsX8);
+    _SpatialOffsets_Output[uint3(pixCoord.xy, H_INDEX_ARRAY(0))] = PackFilteringOffsetsX8(SampleOffsetsX8);
+    
+    
+    // -------------------------- DISK PASSES -------------------------- //
+    float DistanceToPoint = length(WorldPosCenter);
+    float3x3 OrthoBasis = GetLocalFrame(NormalCenter);
+    
+    float RadiusScale = lerp(5.0f, 50.0f, saturate(DistanceToPoint / 500.0f)); 
+    float AmbientOcclusionRadiusScale = lerp(0.3f, 1.0f, pow(AmbientOcclusion.x, 3));
+    float TemporalAccumulationWeight = AmbientOcclusion.y / float(PROBE_AO_MAX_TEMPORAL_SAMPLES);
+    
+    float FilterRadius = DISK_FILTER_MIN_RADIUS;
+    float RadiusStep = DISK_FILTER_STEP_SIZE;
+    
+    UNITY_UNROLL
+    for (int k = 0; k < 3; k++)
+    {
+        float Jitter = GetBNDSequenceSample(pixCoord.xy, 0, 3 + k);
+        float Radius = DistanceToPoint * FilterRadius / RadiusScale * lerp(1.5, 1, TemporalAccumulationWeight);
+        // ClearArrays(SampleOffsetsX8, SampleWeightsX8); // TODO: do we need this?
+        
+        if (DISK_FILTER_USE_AO_GUIDED_RADIUS)
+        {
+            float RadiusUnscaled = Radius;
+            Radius *= AmbientOcclusionRadiusScale;
+            Radius = min(max(Radius, 0.05), RadiusUnscaled);
+        } 
+
+        float Sigma = 0.9f * Radius;
+        
+        int NumSamplesFound = 0;
+        for (int i = 0; i < DISK_FILTER_MAX_SEARCH_SAMPLES; i++)
+        {
+            if (NumSamplesFound >= 8) 
+                break;
+            
+            // Calculate sample coords
+            float2 Sample = _PointDistribution[i + Jitter * 56] * Radius;
+            float3 SamplePosWS = WorldPosCenter + OrthoBasis[0] * Sample.x + OrthoBasis[1] * Sample.y;
+            float4 SamplePosHC = TransformWorldToHClip(SamplePosWS);
+            SamplePosHC.xyz /= SamplePosHC.w;
+            float2 SamplePosSS = SamplePosHC.xy * 0.5f + 0.5f;
+            SamplePosSS.y = 1.0f - SamplePosSS.y;
+            int2 TapCoord = (SamplePosSS * _ScreenSize.xy) / _ProbeSize;
+            float2 TapCoordNDC = (TapCoord + 0.5f) * _ScreenSize.zw * float(_ProbeSize);
+
+            if (any(SamplePosHC.xy > 1.0f) || any(SamplePosHC.xy < -1.0f)) // TODO: do we need this?
+                continue;
+
+            // Load sample data
+            uint2 ProbeOffset;
+            float4 NormalDepthSample = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, TapCoord).xy), ProbeOffset); //npackNormalDepth(asuint(H_LOAD(_NormalDepthDownsampled, TapCoord)));
+            float3 WorldPosSample = ComputeWorldSpacePosition((TapCoord * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw, NormalDepthSample.w, UNITY_MATRIX_I_VP);
+
+            float SampleRadius = length(Sample);
+            
+            // Calculate sample normal & plane weights
+            float NormalWeight = saturate(dot(NormalCenter, NormalDepthSample.xyz));
+            float PlaneWeight = ProbePlaneWeighting(NormalPlane, WorldPosSample, LinearEyeDepth(NormalDepthSample.w, _ZBufferParams), 1000.0f);
+            float GaussianWeight = SampleRadius > 0.001f ? GaussianWeighting(SampleRadius, Sigma) : 1.0f;
+            
+            // If the distance to the sample is acceptable - use more accurate plane estimation
+            if (abs(LinearEyeDepth(NormalDepthSample.w, _ZBufferParams) - SamplePosHC.w) < 0.1)
+                PlaneWeight = PlaneWeighting(WorldPosCenter, WorldPosSample, NormalCenter, NormalDepthSample.xyz, 4);
+
+            // Combine all weights
+            float Weight = NormalWeight * PlaneWeight * lerp(1, GaussianWeight, TemporalAccumulationWeight);
+
+            // Store sample weight & offset if it is above the threshold
+            if (Weight > DISK_FILTER_MINIMUM_ACCEPT_WEIGHT)
+            {
+                SampleOffsetsX8[NumSamplesFound] = TapCoord - pixCoord.xy;
+                SampleWeightsX8[NumSamplesFound] = Weight;
+                NumSamplesFound++;  
+            }
+        }
+        
+        _SpatialWeights_Output[uint3(pixCoord.xy, H_INDEX_ARRAY(1 + k))] = PackFilteringWeightsX8(SampleWeightsX8);
+        _SpatialOffsets_Output[uint3(pixCoord.xy, H_INDEX_ARRAY(1 + k))] = PackFilteringOffsetsX8(SampleOffsetsX8);
+        
+        FilterRadius += RadiusStep;
+    }
+}

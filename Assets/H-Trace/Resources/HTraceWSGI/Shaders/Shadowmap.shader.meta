@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: b1cf932e7f8a73644b2228b0259b88a4
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 300382
+  packageName: 'HTrace: World Space Global Illumination'
+  packageVersion: 1.3.0
+  assetPath: Assets/H-Trace/Resources/HTraceWSGI/Shaders/Shadowmap.shader
+  uploadId: 728261

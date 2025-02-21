@@ -1,0 +1,19 @@
+fileFormatVersion: 2
+guid: 6a85be813ae6a9044b3a05f8ebf294ed
+timeCreated: 1539809628
+licenseType: Store
+MonoImporter:
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Scripts/PipelineProperties.cs
+  uploadId: 705540

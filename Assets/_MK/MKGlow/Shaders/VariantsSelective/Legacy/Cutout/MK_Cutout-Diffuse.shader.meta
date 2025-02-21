@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: f8ae815e0dcd2fb4384b2918ef1784b4
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/VariantsSelective/Legacy/Cutout/MK_Cutout-Diffuse.shader
+  uploadId: 705540

@@ -1,0 +1,258 @@
+#pragma kernel WorldSpaceTracing
+#pragma kernel LightEvaluation
+
+//#pragma multi_compile _ MULTIBOUNCE_APV
+#pragma multi_compile MULTIBOUNCE_OFF MULTIBOUNCE_CACHE MULTIBOUNCE_APV
+#pragma multi_compile PROBE_VOLUMES_OFF PROBE_VOLUMES_L1 PROBE_VOLUMES_L2
+
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+#include "../Includes/VoxelLightingEvaluation.hlsl"
+#include "../Includes/SpatialHash.hlsl"
+#include "../Includes/Reservoir.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Material.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/BuiltinGIUtilities.hlsl"
+#include "Packages/com.unity.render-pipelines.core/Runtime/Lighting/ProbeVolume/ProbeVolume.hlsl"
+
+H_TEXTURE_UINT2(_HTraceStencilBuffer);
+H_TEXTURE3D(float3, _RadianceCacheFiltered);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_VoxelPayload);
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_RayDirection);
+H_TEXTURE(_DepthPyramid);
+H_TEXTURE(_HitDistance);
+H_TEXTURE(_ProbeSeed);
+
+H_RW_TEXTURE(uint2, _VoxelPayload_Output);
+H_RW_TEXTURE(uint, _VoxelBiasOffset_Output);
+H_RW_TEXTURE(float, _HitDistance_Output);
+H_RW_TEXTURE(float4, _HitRadiance_Output);
+
+StructuredBuffer<float2> _PointDistribution;
+RWStructuredBuffer<uint2> _TracingCoords;
+RWStructuredBuffer<uint> _RayCounter;
+
+float _RayLength;
+
+int _IndexXR;
+int _HFrameIndex;
+int _FreezeCache;
+int _OctahedralSize;
+int _ProbeSize;
+
+// ------------------------ FUNCTIONS ------------------------
+
+// ------------------------ WORLD SPACE TRACING -------------------------
+[numthreads(8, 8, 1)]
+void WorldSpaceTracing(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint IndirectCoordOffsetVR = _ScreenSize.x * _ScreenSize.y * _IndexXR;
+    uint RayCounterOffsetVR = 10 * _IndexXR;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[0 + 4 + RayCounterOffsetVR])
+        return;
+    
+    pixCoord.xy = _TracingCoords[RayIndex + IndirectCoordOffsetVR];
+
+    // Calculate probe coords
+    uint2 ProbeOffset;
+    int2 ProbeCoord = floor(pixCoord.xy / _OctahedralSize);
+    int2 CellCoord = pixCoord.xy - floor(pixCoord.xy / _OctahedralSize) * _OctahedralSize;
+    float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, ProbeCoord).xy), ProbeOffset);
+    
+    float2 ProbeCoordNDC = (ProbeCoord.xy * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw ; 
+
+    // Load tracing data
+    float Depth = NormalDepth.w;  
+    float3 RayDirectionWS = H_LOAD(_RayDirection, pixCoord.xy).xyz * 2 - 1;
+    float3 PositionWS = ComputeWorldSpacePosition(ProbeCoordNDC, Depth, UNITY_MATRIX_I_VP);
+
+    // Start world space tracing where the screen space part finished
+    bool Unused;
+    uint HitDistancePacked = asuint(H_LOAD(_HitDistance, pixCoord.xy).x);
+    float HitDistanceWS = abs(UnpackHitDistance(HitDistancePacked, Unused, Unused));
+    float3 RayOriginWS = PositionWS + HitDistanceWS * RayDirectionWS;
+    
+    // If the ray travelled less than half a voxel - reset it to origin
+    if (HitDistanceWS <= _VoxelSize * 0.5f)
+    {
+        RayOriginWS = PositionWS;
+        HitDistanceWS = 0;
+    }
+    
+    // Apply voxel bias
+    VoxelBias(pixCoord.xy, _DepthPyramid, _PointDistribution, Depth, HitDistanceWS, NormalDepth.xyz, RayDirectionWS, RayOriginWS);
+    
+    // Initialize voxel ray payload
+    VoxelPayload Payload;
+    InitializePayload(Payload);
+
+    // Calculate ray distance
+    float MaxRayDistance = MaxVoxelRayDistance(GetAbsolutePositionWS(RayOriginWS), RayDirectionWS.xyz);
+    float RayDistance = _RayLength == 0 ? MaxRayDistance : _RayLength;
+    
+    // Trace into Voxels
+    bool HitFound = TraceVoxelsDiffuse(GetAbsolutePositionWS(RayOriginWS), RayDirectionWS.xyz, RayDistance, 128, Payload);
+    
+    if (!HitFound)
+        Payload.HitDistance = 100; // TODO: check this
+
+    // Total distance travelled by the ray in screen-space + world-space
+    float TotalDistance = HitDistanceWS + Payload.HitDistance;
+    
+    // Write total (screen-space + world-space) hit distance
+    _HitDistance_Output[H_COORD(pixCoord.xy)] = max(TotalDistance, 0.001f);
+    
+    // Pack voxel payload
+    float3 VoxelHitOffset = VoxelCoordToAbsoluteWorldPosition(Payload.HitCoord) - Payload.HitPosition;
+     _VoxelPayload_Output[H_COORD(pixCoord.xy)] = PackVoxelHitPayload(VoxelHitOffset, TotalDistance, Payload.HitNormal, Payload.HitCoord, HitFound);
+
+    // Add skylight if we missed
+    if (!HitFound && dot(float3(0,1,0), RayDirectionWS) > _SkyOcclusionCone + 0.05f)
+    {
+        // Evaluate sky occlusion
+        float SkyOcclusion = HitFound ? 1 : EvaluateDirectionalShadowOcclusion(GetAbsolutePositionWS(RayOriginWS) + MaxRayDistance * RayDirectionWS);
+        
+        Payload.HitColor += SAMPLE_TEXTURECUBE_ARRAY_LOD(_SkyTexture, H_SAMPLER_TRILINEAR_CLAMP, RayDirectionWS, 0, 2).xyz * SkyOcclusion * SKY_LIGHT_INTENSITY;
+        
+        // Write evaluated hit radiance
+        _HitRadiance_Output[H_COORD(pixCoord.xy)] = float4(Payload.HitColor.xyz, 1);
+    }
+}
+
+
+// ---------------------- WORLD SPACE HIT LIGHTING EVALUATION -----------------------
+[numthreads(8, 8, 1)]
+void LightEvaluation(uint3 pixCoord : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(_IndexXR);
+    uint IndirectCoordOffsetVR =  _ScreenSize.x * _ScreenSize.y * _IndexXR;
+    uint RayCounterOffsetVR = 10 * _IndexXR;
+    
+    uint RayIndex = groupID * 64 + groupIndex;
+    if (RayIndex >= _RayCounter[0 + 4 + RayCounterOffsetVR])
+        return;
+    
+    pixCoord.xy = _TracingCoords[RayIndex + IndirectCoordOffsetVR];
+    
+    // Initialize voxel ray payload
+    VoxelPayload Payload;
+    InitializePayload(Payload);
+
+    // Read packed voxel payload
+    uint2 PayloadPacked = asuint(H_LOAD(_VoxelPayload, pixCoord.xy).xy);
+
+    // Unpack voxel payload
+    float3 HitOffset; float TotalRayDistance;
+    bool HitFound = UnpackVoxelHitPayload(PayloadPacked, TotalRayDistance, HitOffset, Payload.HitNormal, Payload.HitCoord);
+
+    // Early-out on the miss with APV evaluation (if available)
+    if (!HitFound)
+    {
+        if (_EnableProbeVolumes)
+        {
+            if (APV_FALLBACK && (PROBE_VOLUMES_L1 || PROBE_VOLUMES_L2))
+            {
+                // Prepare Normal, Depth and PositionWS for APV evaluation
+                uint2 ProbeOffset;
+                float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy / _OctahedralSize).xy), ProbeOffset);
+                float2 ProbeCoordNDC = (floor(pixCoord.xy / _OctahedralSize) * float(_ProbeSize) + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw ; 
+                float3 PositionWS = ComputeWorldSpacePosition(ProbeCoordNDC.xy, NormalDepth.w, UNITY_MATRIX_I_VP);
+    
+                // Evaluate APV
+                float3 Unused = 0.0;
+                float3 HitRadiance = 0.0f;
+                EvaluateAdaptiveProbeVolume(GetAbsolutePositionWS(PositionWS), NormalDepth.xyz, -NormalDepth.xyz, GetWorldSpaceNormalizeViewDir(PositionWS), 100, HitRadiance, Unused);
+    
+                // Output hit radiance and early out
+                _HitRadiance_Output[H_COORD(pixCoord.xy)] = float4(HitRadiance, 1);
+            }
+        }
+        
+        return;
+    }
+    
+    // Calculate hit position
+    Payload.HitPosition = VoxelCoordToAbsoluteWorldPosition(Payload.HitCoord) + HitOffset;
+    
+    // Read & spawn hash entries if it is a hit
+    if (HitFound)
+    {
+        // Evauluate lighting on hit point
+        EvaluateHitLighting(Payload);
+
+        if (MULTIBOUNCE_CACHE)
+        {
+            uint3 CacheCoord = ComputeRadianceCacheCoord(Payload.HitCoord);
+            uint HashKey = PackHashKey(CacheCoord, Payload.HitNormal);
+
+            bool IsEmpty;
+            uint HashRank = 2;
+            uint HashProbingIndex, HashLowestRankIndex;
+            uint HashIndex = HashGetIndex(CacheCoord, PackVoxelNormalIndex(Payload.HitNormal));
+            bool HashFound = HashFindAny(HashIndex, HashKey, HashRank, HashLowestRankIndex, HashProbingIndex, IsEmpty);
+
+            int3 VoxelCoordAbsolute = VoxelCoordToAbsoluteVoxelCoord(Payload.HitCoord); 
+            float3 VoxelHitOffset = (float3(VoxelCoordAbsolute) * _VoxelSize) - (Payload.HitPosition) ;
+
+            if (HashFound) // If a valid entry was found we reset the decay counter to max value and use cache (it's main purpose)
+            {
+                uint3 HitCachePacked = _HashBuffer_Radiance[HashProbingIndex].xyz;
+
+                float3 RadianceFullRange = UnpackCacheRadianceFull(HitCachePacked.xyz);
+                float3 RadianceNearRange = UnpackCacheRadianceNear(HitCachePacked.xyz);
+
+                // Choose far / near field cache based on the travelled ray distance
+                Payload.HitCache = TotalRayDistance > _VoxelSize.x * 4 ? RadianceFullRange : min(RadianceNearRange, RadianceFullRange);
+
+                // Progressively dim cache at a distance smaller than a voxel size
+                Payload.HitCache *= lerp(0, 1, saturate(TotalRayDistance / 1 / _VoxelSize));
+
+                // Clip cache
+                Payload.HitCache *= GetCurrentExposureMultiplier();
+                Payload.HitCache = HClipRadiance(Payload.HitCache, 10);
+                Payload.HitCache *= GetInverseCurrentExposureMultiplier();
+
+                // Add cache to hit radiance
+                Payload.HitColor += Payload.HitCache * Payload.HitDiffuse; 
+
+                // Reset decay counter back to 255 as we hit this cache cell - it is useful
+                _HashBuffer_Counter[HashProbingIndex] = 255;
+            }
+            else if (IsEmpty && !FREEZE_CACHE) // If we didn't find a valid entry but found an empty cell, we spawn a new entry 
+            {
+                _HashBuffer_Position[HashProbingIndex] = uint4(asuint(VoxelCoordAbsolute.xyz), PackHitOffset(VoxelHitOffset));
+                _HashBuffer_Radiance[HashProbingIndex] = 0;
+                _HashBuffer_Counter[HashProbingIndex] = 255;
+                _HashBuffer_Key[HashProbingIndex] = HashKey | 0x2; 
+            }
+            else if (HashRank != 2 && !FREEZE_CACHE) // If neither a valid nor an empty entry was found, we recycle the lowest ranked cell to spawn a new entry
+            {
+                _HashBuffer_Position[HashLowestRankIndex] = uint4(asuint(VoxelCoordAbsolute.xyz), PackHitOffset(VoxelHitOffset));
+                _HashBuffer_Radiance[HashLowestRankIndex] = 0;
+                _HashBuffer_Counter[HashLowestRankIndex] = 255;
+                _HashBuffer_Key[HashLowestRankIndex] = HashKey | 0x2; 
+            }  
+        }
+        else if (MULTIBOUNCE_APV)
+        {
+            if (_EnableProbeVolumes)
+            {
+                if (APV_FALLBACK && (PROBE_VOLUMES_L1 || PROBE_VOLUMES_L2))
+                {
+                    float3 Unused = 0;
+                    EvaluateAdaptiveProbeVolume(Payload.HitPosition, Payload.HitNormal, 0.0, 0.0, 100, Payload.HitCache, Unused);
+                    Payload.HitCache *= smoothstep(0.15f, 1.0f, saturate(TotalRayDistance / 4.0f / _VoxelSize));
+                    Payload.HitColor += Payload.HitCache * Payload.HitDiffuse;
+                }
+            }
+        }
+    }
+    
+    // Write evaluated hit radiance
+    _HitRadiance_Output[H_COORD(pixCoord.xy)] = float4(Payload.HitColor.xyz, 1);
+}

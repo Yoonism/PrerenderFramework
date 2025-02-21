@@ -1,0 +1,48 @@
+#pragma kernel CopyProbeAtlases
+#pragma kernel CopyProbeBuffers
+#pragma kernel CopyFullResBuffers
+
+#include "../Headers/HMain.hlsl"
+
+H_TEXTURE(_GeometryNormal);
+H_TEXTURE(_ShadowGuidanceMask);
+H_TEXTURE(_ShadowGuidanceMask_Samplecount);
+H_TEXTURE(_ShadowGuidanceMask_Accumulated);
+
+H_RW_TEXTURE(uint2, _NormalDepth_HistoryOutput);
+H_RW_TEXTURE(float, _ShadowGuidanceMask_HistoryOutput);
+H_RW_TEXTURE(float, _ShadowGuidanceMask_SamplecountHistoryOutput);
+H_RW_TEXTURE(float, _ShadowGuidanceMask_CheckerboardHistoryOutput);
+
+
+// ------------------------ PROBE ATLAS COPY ------------------------
+[numthreads(8, 8, 1)]
+void CopyProbeAtlases(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _ShadowGuidanceMask_CheckerboardHistoryOutput[H_COORD(pixCoord.xy)] = H_LOAD(_ShadowGuidanceMask, pixCoord.xy).x;
+    _ShadowGuidanceMask_HistoryOutput[H_COORD(pixCoord.xy)] = H_LOAD(_ShadowGuidanceMask_Accumulated, pixCoord.xy).x;
+}
+
+
+// ------------------------ PROBE BUFFER COPY ------------------------
+[numthreads(8, 8, 1)]
+void CopyProbeBuffers(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _ShadowGuidanceMask_SamplecountHistoryOutput[H_COORD(pixCoord.xy)] = H_LOAD(_ShadowGuidanceMask_Samplecount, pixCoord.xy).x;
+}
+
+
+// ------------------------ FULL RES BUFFER COPY ------------------------
+[numthreads(8, 8, 1)]
+void CopyFullResBuffers(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    float DepthForHistory = HBUFFER_DEPTH(pixCoord.xy);
+    float3 NormalForHistory = H_LOAD(_GeometryNormal, pixCoord.xy).xyz;
+  //  _NormalDepth_HistoryOutput[H_COORD(pixCoord.xy)] = PackNormalDepth(NormalForHistory, DepthForHistory);
+}

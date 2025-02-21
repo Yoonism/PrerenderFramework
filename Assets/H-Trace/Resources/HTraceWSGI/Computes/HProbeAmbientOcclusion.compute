@@ -1,0 +1,161 @@
+#pragma kernel ProbeAmbientOcclusion
+#pragma kernel ProbeAmbientOcclusionSpatialFilter
+#pragma kernel ProbeAmbientOcclusionHistoryUpdate
+
+#include "../Includes/Config.hlsl"
+#include "../Includes/TemporalReprojection.hlsl"
+#include "../Includes/VoxelTraversal.hlsl"
+
+H_TEXTURE(_RayDirection);
+H_TEXTURE(_RayDistanceSS);
+H_TEXTURE(_RayDistanceWS);
+H_TEXTURE(_ProbeNormalDepth);
+H_TEXTURE(_ReprojectionWeights);
+H_TEXTURE(_ProbeAmbientOcclusion);
+H_TEXTURE(_PersistentReprojectionCoord);
+H_TEXTURE(_ProbeAmbientOcclusion_History);
+
+H_TEXTURE_ARRAY(_SpatialWeightsPacked);
+H_TEXTURE_ARRAY(_SpatialOffsetsPacked);
+
+H_RW_TEXTURE(uint, _ProbeAmbientOcclusion_Output);
+H_RW_TEXTURE(float, _ProbeAmbientOcclusion_OutputFiltered);
+
+
+// ------------------------ PROBE AMBIENT OCCLUSION GATHER & ACCUMULATION ------------------------
+[numthreads(8, 8, 1)]
+void ProbeAmbientOcclusion(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Load probe normal, depth & offset
+    uint2 ProbeOffset;
+    float4 NormalDepth = UnpackNormalDepth(asuint(H_LOAD(_ProbeNormalDepth, pixCoord.xy)).xy, ProbeOffset);
+    float2 ProbeCoordNDC = (pixCoord.xy * _ProbeSize + float2(ProbeOffset) + 0.5f) * _ScreenSize.zw; 
+    float3 PositionWS = ComputeWorldSpacePosition(ProbeCoordNDC.xy, NormalDepth.w, UNITY_MATRIX_I_VP);
+    
+    float WeightGathered = 0;
+    float OcclusionGathered = 0;
+    float MaxClampDistance = PROBE_AO_CLAMP_DISTANCE;
+
+    // Scale max 
+    MaxClampDistance = lerp(MaxClampDistance * 0.1, MaxClampDistance, saturate(length(PositionWS) / 5.0f)); 
+
+    // Gather hit ray distance across all probe cells
+    for (int x = 0; x < _OctahedralSize; x++)
+    {
+        for (int y = 0; y < _OctahedralSize; y++)
+        {
+            int2 SampleCoord = pixCoord.xy * _OctahedralSize + uint2(x,y);
+
+            // Load SS and WS hit distances and other data
+            bool TracedWorldRay, IsOutsideFrame;
+            float HitDistancWS = H_LOAD(_RayDistanceWS, SampleCoord).x;
+            float HitDistancSS = abs(UnpackHitDistance(asuint(H_LOAD(_RayDistanceSS, SampleCoord).x), IsOutsideFrame, TracedWorldRay));
+
+            // Out ambient occlusion sample is simply our WS hit distance in this case
+            float OcclusionSample = HitDistancWS;
+
+            // We can discard too short WS rays to avoid darkening around the corners and behind objects
+            if (HitDistancWS <= _VoxelSize.x && TracedWorldRay)
+            {   
+                OcclusionSample = IsOutsideFrame ? MaxClampDistance : OcclusionSample;
+                OcclusionSample = lerp(MaxClampDistance, OcclusionSample, saturate(length(PositionWS) / 1.0f));
+            }
+
+            // Clamp our sample to the maximum occlusion distance
+            OcclusionSample = clamp(OcclusionSample, 0, MaxClampDistance);
+
+            // Calculate octahedral direction and get cosine weight for this sample
+            float3 RayDirection = OrientedOctahedronToDirection((float2(x, y) + 0.5f) / float(_OctahedralSize), NormalDepth.xyz);
+            float Weight = saturate(dot(RayDirection, NormalDepth.xyz));
+
+            // Of sample (distance) <= 0 - it means that it's a cell culled by checkerboarding
+            if (OcclusionSample > 0)
+            {
+                WeightGathered += MaxClampDistance * Weight;
+                OcclusionGathered += OcclusionSample * Weight;  
+            }
+        }
+    }
+
+    // Weighted average
+    OcclusionGathered = saturate(OcclusionGathered / WeightGathered);
+
+    // Load reprojection coords and weights and normalize them
+    uint ReprojectionIndex;
+    float4 ReprojectionWeights = H_LOAD(_ReprojectionWeights, pixCoord.xy);
+    int2 ReprojectionCoordPacked = asuint(H_LOAD(_PersistentReprojectionCoord, pixCoord.xy).xy);
+    int2 ReprojectionCoord = UnpackPersistentReprojectionCoord(ReprojectionCoordPacked, ReprojectionIndex);
+
+    // Normalize reprojection weights
+    float WeightsSumm = max(ReprojectionWeights.x + ReprojectionWeights.y + ReprojectionWeights.z + ReprojectionWeights.w, 1.0e-3);
+    ReprojectionWeights /= WeightsSumm;
+
+    // Load packed occlusion history samples
+    uint OcclusionHistoryPacked00 = asuint(H_LOAD_ARRAY(_ProbeAmbientOcclusion_History, ReprojectionCoord + uint2(0, 0), GetHistoryIndex(ReprojectionIndex)).x);
+    uint OcclusionHistoryPacked01 = asuint(H_LOAD_ARRAY(_ProbeAmbientOcclusion_History, ReprojectionCoord + uint2(1, 0), GetHistoryIndex(ReprojectionIndex)).x);
+    uint OcclusionHistoryPacked10 = asuint(H_LOAD_ARRAY(_ProbeAmbientOcclusion_History, ReprojectionCoord + uint2(0, 1), GetHistoryIndex(ReprojectionIndex)).x);
+    uint OcclusionHistoryPacked11 = asuint(H_LOAD_ARRAY(_ProbeAmbientOcclusion_History, ReprojectionCoord + uint2(1, 1), GetHistoryIndex(ReprojectionIndex)).x);
+        
+    // Unpack occlusion history (.x channel) and its samplecount (.y channel)
+    float2 OcclusionHistory00 = UnpackProbeAO(OcclusionHistoryPacked00, PROBE_AO_MAX_TEMPORAL_SAMPLES) * ReprojectionWeights.xx;
+    float2 OcclusionHistory01 = UnpackProbeAO(OcclusionHistoryPacked01, PROBE_AO_MAX_TEMPORAL_SAMPLES) * ReprojectionWeights.yy;
+    float2 OcclusionHistory10 = UnpackProbeAO(OcclusionHistoryPacked10, PROBE_AO_MAX_TEMPORAL_SAMPLES) * ReprojectionWeights.zz;
+    float2 OcclusionHistory11 = UnpackProbeAO(OcclusionHistoryPacked11, PROBE_AO_MAX_TEMPORAL_SAMPLES) * ReprojectionWeights.ww;
+
+    // Combine bilinear samples
+    float2 OcclusionHistoryReprojected = OcclusionHistory00 + OcclusionHistory01 + OcclusionHistory10 + OcclusionHistory11;
+
+    // Temporally accumulate
+    float SampleCount = min(PROBE_AO_MAX_TEMPORAL_SAMPLES, OcclusionHistoryReprojected.y + 1);
+    OcclusionGathered = lerp(OcclusionGathered, OcclusionHistoryReprojected.x, 1.0f - (1.0f / float(SampleCount)));
+
+    // Output
+    _ProbeAmbientOcclusion_Output[H_COORD(pixCoord.xy)] = PackProbeAO(OcclusionGathered, SampleCount, PROBE_AO_MAX_TEMPORAL_SAMPLES);
+}
+
+
+// ------------------------ PROBE AMBIENT OCCLUSION SPATIAL FILTER ------------------------
+[numthreads(8, 8, 1)]
+void ProbeAmbientOcclusionSpatialFilter(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    // Load packed sample weights and coords
+    float SampleWeights[8]; int2 SampleOffsets[8];
+    uint4 PackedSampleOffsets = asuint(H_LOAD_ARRAY(_SpatialOffsetsPacked, pixCoord.xy, 0));
+    uint4 PackedSampleWeights = asuint(H_LOAD_ARRAY(_SpatialWeightsPacked, pixCoord.xy, 0));
+
+    // Unpack sample weights and coords
+    UnpackFilteringOffsetsX8(PackedSampleOffsets, SampleOffsets);
+    UnpackFilteringWeightsX8(PackedSampleWeights, SampleWeights);
+
+    // Unpack center occlusion and samplecount
+    uint ProbeAmbientOcclusionPacked = asuint(H_LOAD(_ProbeAmbientOcclusion, pixCoord.xy).x);
+    float2 ProbeAmbientOcclusion = UnpackProbeAO(ProbeAmbientOcclusionPacked, PROBE_AO_MAX_TEMPORAL_SAMPLES);
+
+    // Scale filter weight based on the accumulated samplecount
+    float SpatialWeight = ProbeAmbientOcclusion.y == PROBE_AO_MAX_TEMPORAL_SAMPLES ? 0 : lerp(1, 0, 1.0f - (1.0f / float(ProbeAmbientOcclusion.y)));
+
+    float AccumulatedWeight = 1;
+    for (int i = 0; i < 8; i++)
+    {
+        uint ProbeAmbientOcclusionSamplePacked = asuint(H_LOAD(_ProbeAmbientOcclusion, pixCoord.xy + SampleOffsets[i]).x);
+
+        AccumulatedWeight += SampleWeights[i] * SpatialWeight;
+        ProbeAmbientOcclusion.x += UnpackProbeAO(ProbeAmbientOcclusionSamplePacked, 0).x * SampleWeights[i] * SpatialWeight;
+    }
+    
+    _ProbeAmbientOcclusion_OutputFiltered[H_COORD(pixCoord.xy)] = ProbeAmbientOcclusion.x / AccumulatedWeight;
+}
+
+
+// ------------------------ PROBE AMBIENT OCCLUSION HISTORY UPDATE ------------------------
+[numthreads(8, 8, 1)]
+void ProbeAmbientOcclusionHistoryUpdate(uint3 pixCoord : SV_DispatchThreadID, uint2 groupThreadID : SV_GroupThreadID, uint groupIndex : SV_GroupIndex, uint groupID : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(pixCoord.z);
+    
+    _ProbeAmbientOcclusion_Output[uint3(pixCoord.xy, H_INDEX_ARRAY(uint(_FrameCount) % _PersistentHistorySamples))] = asuint(H_LOAD(_ProbeAmbientOcclusion, pixCoord.xy).x);
+}

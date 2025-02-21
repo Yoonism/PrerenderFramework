@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: c04b7cae8accdfb4e9c2648823ff39d7
+ShaderImporter:
+  defaultTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/Selective/MKGlowSelectiveRender.shader
+  uploadId: 705540

@@ -1,0 +1,16 @@
+fileFormatVersion: 2
+guid: c38b20dca860eb1409ca892320961924
+ShaderImporter:
+  externalObjects: {}
+  defaultTextures: []
+  nonModifiableTextures: []
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 90204
+  packageName: MK Glow - Bloom & Lens & Glare
+  packageVersion: 4.9.0
+  assetPath: Assets/_MK/MKGlow/Shaders/Inc/Presample.hlsl
+  uploadId: 705540
